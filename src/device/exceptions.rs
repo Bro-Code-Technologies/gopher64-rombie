@@ -147,11 +147,10 @@ pub fn reset_event(device: &mut device::Device) {
     device.cpu.cop0.regs[device::cop0::COP0_STATUS_REG] &= !device::cop0::COP0_STATUS_TS;
 
     device.cpu.cop0.regs[device::cop0::COP0_ERROREPC_REG] = device.cpu.pc;
-    device.cpu.pc = 0xBFC00000;
-    device.cpu.branch_state.state = device::cpu::State::Step;
     device.rsp.regs2[device::rsp_interface::SP_PC_REG] = 0;
 
     device::pif::reset_pif(device, true);
+    device::pif::boot_hle(device);
 
     ui::video::onscreen_message("Game reset", ui::video::MESSAGE_LENGTH_MESSAGE_SHORT);
 }

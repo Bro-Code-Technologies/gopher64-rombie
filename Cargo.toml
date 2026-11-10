@@ -6,7 +6,17 @@ rust-version = "1.99.0"
 
 [features]
 default = ["gui"]
-gui = ["dep:rfd", "dep:slint", "dep:open", "dep:slint-build"]
+gui = ["upstream-extras", "dep:rfd", "dep:slint", "dep:open", "dep:slint-build"]
+# What the Rombie engine build (--no-default-features) leaves out: gopher64's own netplay, RetroAchievements and
+# Discord presence, web requests and TLS, and the cheat list (docs/rombie/notes.md).
+upstream-extras = [
+    "dep:matchbox_socket",
+    "dep:ggrs",
+    "dep:reqwest",
+    "dep:discord-rich-presence",
+    "dep:rustls",
+    "tokio-tungstenite/rustls-tls-webpki-roots",
+]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -19,14 +29,14 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde-big-array = "0.5"
 sha2 = "0.11"
-tokio = {version = "1.46", features = ["rt-multi-thread", "fs", "process"] }
+tokio = {version = "1.46", features = ["rt-multi-thread", "fs", "process", "sync", "macros", "time", "net", "io-util"] }
 spin_sleep = "1.3"
 encoding_rs = "0.8"
 mimalloc = "0.1"
 regex = "1.11"
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
-matchbox_socket = "0.14"
-ggrs = { version = "0.13", features = ["sync-send"] }
+tokio-tungstenite = "0.30"
+matchbox_socket = { version = "0.14", optional = true }
+ggrs = { version = "0.13", features = ["sync-send"], optional = true }
 rustc-hash = "2.1"
 futures = "0.3"
 rand = { version = "0.10", features = ["serde"] }
@@ -34,11 +44,11 @@ fatfs = "0.3"
 semver = "1.0"
 postcard = { version = "1.1", features = ["use-std"] }
 clap = { version = "4.5", features = ["derive"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy", "json", "query"] }
-discord-rich-presence = "1.1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy", "json", "query"], optional = true }
+discord-rich-presence = { version = "1.1", optional = true }
 quick-xml = "0.42"
 obfstr = "0.4"
-rustls = { version = "0.23", default-features = false }
+rustls = { version = "0.23", default-features = false, optional = true }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 slint = { version = "1.16", default-features = false, features = ["compat-1-2", "std", "unstable-winit-030", "backend-winit", "renderer-femtovg-wgpu", "accessibility"], optional = true }

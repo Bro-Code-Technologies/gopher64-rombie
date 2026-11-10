@@ -2,7 +2,9 @@
 
 mod cheats;
 mod device;
+#[cfg_attr(not(feature = "upstream-extras"), path = "netplay_off.rs")]
 mod netplay;
+#[cfg_attr(not(feature = "upstream-extras"), path = "retroachievements_off.rs")]
 mod retroachievements;
 mod savestates;
 mod ui;
@@ -206,7 +208,11 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
             }
         }
 
+        #[cfg(not(feature = "upstream-extras"))]
+        let ra_config = retroachievements::RAConfig::default();
+        #[cfg(feature = "upstream-extras")]
         let file_path = dirs.config_dir.join("retroachievements.json");
+        #[cfg(feature = "upstream-extras")]
         let ra_config = if let ra_config = std::fs::read(&file_path).unwrap_or_default()
             && let ra_config =
                 serde_json::from_slice::<retroachievements::RAConfig>(ra_config.as_ref())
@@ -270,7 +276,7 @@ pub fn run(args: Args, arg_count: usize) -> std::io::Result<()> {
         );
 
         // on Android, the client is shut down in the app_window function
-        #[cfg(not(target_os = "android"))]
+        #[cfg(all(feature = "upstream-extras", not(target_os = "android")))]
         retroachievements::shutdown_client();
 
         if device.netplay.is_none() {

@@ -138,6 +138,7 @@ pub fn update_screen(device: &mut device::Device) {
 
     if !netplay::in_rollback(device.netplay.as_ref()) {
         ui::video::update_screen();
+        ui::speed_log("f", (device.vi.frame_time * 1e9) as u64);
         device.speed_limiter.frame_counter += 1;
         let _ = device.ui.video.vis_tx.as_ref().unwrap().send(true);
     }
@@ -197,10 +198,12 @@ pub fn init(device: &mut device::Device) {
 
 fn speed_limiter(device: &mut device::Device) {
     let mut speed_limiter_toggled = false;
+    #[cfg_attr(not(feature = "upstream-extras"), allow(unused_mut))]
     let mut interval = std::time::Duration::from_secs_f64(
         device.vi.frame_time * device.speed_limiter.limit_freq as f64,
     );
 
+    #[cfg(feature = "upstream-extras")]
     if let Some(netplay) = &device.netplay {
         let ahead = netplay.session.frames_ahead();
         if ahead > 0 {

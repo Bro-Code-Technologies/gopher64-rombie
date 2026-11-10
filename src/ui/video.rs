@@ -1,5 +1,7 @@
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
+// the bindings' MESSAGE_LENGTH_MESSAGE_LONG is used only by upstream's netplay
+#![cfg_attr(not(feature = "upstream-extras"), allow(dead_code))]
 include!(concat!(env!("OUT_DIR"), "/parallel_bindings.rs"));
 use crate::{device, netplay, retroachievements, ui};
 

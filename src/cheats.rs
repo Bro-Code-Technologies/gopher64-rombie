@@ -28,8 +28,12 @@ pub fn init(
     device: &mut device::Device,
     cheat_settings: rustc_hash::FxHashMap<String, Option<String>>,
 ) {
-    let cheats = serde_json::from_slice::<Cheat>(include_bytes!("../data/cheats.json"))
-        .unwrap()
+    // The cheat list has no stated source, so the Rombie engine build leaves it out.
+    #[cfg(feature = "upstream-extras")]
+    let list = serde_json::from_slice::<Cheat>(include_bytes!("../data/cheats.json")).unwrap();
+    #[cfg(not(feature = "upstream-extras"))]
+    let list = Cheat::new();
+    let cheats = list
         .get(&ui::storage::get_game_crc(&device.cart.rom))
         .cloned()
         .unwrap_or_default();

@@ -16,6 +16,7 @@ unsafe extern "C" fn audio_callback(
     _total_amount: i32,
 ) {
     if additional_amount > 0 {
+        ui::speed_log("u", additional_amount as u64);
         unsafe {
             sdl3_sys::audio::SDL_PutAudioStreamData(
                 audio_stream,

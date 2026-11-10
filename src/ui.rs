@@ -20,6 +20,7 @@ pub mod vru;
 
 pub const APP_ID: &str = "io.github.gopher64.gopher64";
 
+#[cfg(feature = "upstream-extras")]
 pub fn install_default_crypto_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         rustls::crypto::ring::default_provider()
@@ -28,6 +29,7 @@ pub fn install_default_crypto_provider() {
     }
 }
 
+#[cfg(feature = "upstream-extras")]
 pub static WEB_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
     install_default_crypto_provider();
 
@@ -52,6 +54,25 @@ pub static WEB_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLoc
 
     builder.build().unwrap()
 });
+
+// Rombie's speed test (docs/rombie/notes.md): when GOPHER64_ROMBIE_SPEED_LOG names a file, each finished frame and
+// each audio underrun is written to it, with the microseconds since the first entry.
+static SPEED_LOG: std::sync::LazyLock<
+    Option<std::sync::Mutex<(std::fs::File, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| {
+    let file = std::fs::File::create(std::env::var_os("GOPHER64_ROMBIE_SPEED_LOG")?).ok()?;
+    Some(std::sync::Mutex::new((file, std::time::Instant::now())))
+});
+
+pub fn speed_log(kind: &str, value: u64) {
+    use std::io::Write;
+    if let Some(log) = SPEED_LOG.as_ref()
+        && let Ok(mut log) = log.lock()
+    {
+        let micros = log.1.elapsed().as_micros();
+        let _ = writeln!(log.0, "{kind} {micros} {value}");
+    }
+}
 
 #[derive(Default, Clone)]
 pub struct Dirs {

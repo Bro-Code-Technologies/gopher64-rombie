@@ -158,45 +158,53 @@ fn main() {
     simd_build.flag("-flto=thin");
     retroachievements_build.flag("-flto=thin");
 
+    if cfg!(feature = "upstream-extras") {
+        rdp_build.define("GOPHER64_UPSTREAM_EXTRAS", None);
+    }
+
     volk_build.compile("volk");
     rdp_build.compile("parallel-rdp");
-    retroachievements_build.compile("retroachievements");
 
     let out_path = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
-    let mut retroachievements_builder = bindgen::Builder::default()
-        .header("retroachievements/retroachievements.h")
-        .allowlist_function("ra_init_client")
-        .allowlist_function("ra_welcome")
-        .allowlist_function("ra_shutdown_client")
-        .allowlist_function("ra_get_hardcore")
-        .allowlist_function("ra_load_game")
-        .allowlist_function("ra_unload_game")
-        .allowlist_function("ra_set_rdram")
-        .allowlist_function("ra_do_frame")
-        .allowlist_function("ra_do_idle")
-        .allowlist_function("ra_http_callback")
-        .allowlist_function("ra_login_user")
-        .allowlist_function("ra_login_token_user")
-        .allowlist_function("ra_state_size")
-        .allowlist_function("ra_save_state")
-        .allowlist_function("ra_load_state")
-        .allowlist_function("ra_get_rich_presence");
+    // rcheevos is one of the upstream extras the Rombie engine build leaves out
+    if cfg!(feature = "upstream-extras") {
+        retroachievements_build.compile("retroachievements");
 
-    if cfg!(feature = "gui") {
-        retroachievements_builder = retroachievements_builder
-            .allowlist_function("ra_logout_user")
-            .allowlist_function("ra_get_username");
+        let mut retroachievements_builder = bindgen::Builder::default()
+            .header("retroachievements/retroachievements.h")
+            .allowlist_function("ra_init_client")
+            .allowlist_function("ra_welcome")
+            .allowlist_function("ra_shutdown_client")
+            .allowlist_function("ra_get_hardcore")
+            .allowlist_function("ra_load_game")
+            .allowlist_function("ra_unload_game")
+            .allowlist_function("ra_set_rdram")
+            .allowlist_function("ra_do_frame")
+            .allowlist_function("ra_do_idle")
+            .allowlist_function("ra_http_callback")
+            .allowlist_function("ra_login_user")
+            .allowlist_function("ra_login_token_user")
+            .allowlist_function("ra_state_size")
+            .allowlist_function("ra_save_state")
+            .allowlist_function("ra_load_state")
+            .allowlist_function("ra_get_rich_presence");
+
+        if cfg!(feature = "gui") {
+            retroachievements_builder = retroachievements_builder
+                .allowlist_function("ra_logout_user")
+                .allowlist_function("ra_get_username");
+        }
+
+        let retroachievements_bindings = retroachievements_builder
+            .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+            .generate()
+            .expect("Unable to generate bindings");
+
+        retroachievements_bindings
+            .write_to_file(out_path.join("retroachievements_bindings.rs"))
+            .expect("Couldn't write bindings!");
     }
-
-    let retroachievements_bindings = retroachievements_builder
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        .generate()
-        .expect("Unable to generate bindings");
-
-    retroachievements_bindings
-        .write_to_file(out_path.join("retroachievements_bindings.rs"))
-        .expect("Couldn't write bindings!");
 
     let parallel_bindings = bindgen::Builder::default()
         .header("parallel-rdp/interface.hpp")

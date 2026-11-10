@@ -1,10 +1,7 @@
-mod rom;
 use crate::device;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Pif {
-    #[serde(with = "serde_big_array::BigArray")]
-    pub rom: [u8; 1984],
     #[serde(with = "serde_big_array::BigArray")]
     pub ram: [u8; 64],
     pub channels: [PifChannel; 5],
@@ -37,11 +34,8 @@ pub fn read_mem(
 
     let mut masked_address = address as usize & PIF_MASK;
     if masked_address < PIF_RAM_OFFSET {
-        u32::from_be_bytes(
-            device.pif.rom[masked_address..masked_address + 4]
-                .try_into()
-                .unwrap(),
-        )
+        // No boot ROM is carried (boot_hle stands in for it), so this reads as a locked-out ROM does.
+        0
     } else {
         masked_address -= PIF_RAM_OFFSET;
         u32::from_be_bytes(
@@ -203,12 +197,6 @@ pub fn process_ram(device: &mut device::Device) {
         // Terminate boot process
         clrmask |= 0x08;
     }
-    if command & 0x10 != 0 {
-        // ROM lockout
-        for i in device.pif.rom.iter_mut() {
-            *i = 0
-        }
-    }
     if command & 0x20 != 0 {
         // Acquire checksum
         device.pif.ram[0x3F] = 0x80
@@ -250,18 +238,104 @@ fn get_default_handler(device: &device::Device) -> device::controller::PakHandle
 }
 
 pub fn reset_pif(device: &mut device::Device, is_nmi_reset: bool) {
-    if device.cart.pal {
-        device.pif.rom = rom::PAL_PIF_ROM;
-    } else {
-        device.pif.rom = rom::NTSC_PIF_ROM;
-    }
-
     let reset_type = u32::from(is_nmi_reset);
     let rom_type = 0u32;
     let s7 = 0u32;
     let cic = u32::from(device.cart.cic_seed);
     let word = (rom_type << 19) | (s7 << 18) | (reset_type << 17) | (cic << 8) | 0x3f;
     device.pif.ram[0x24..0x28].copy_from_slice(&word.to_be_bytes());
+}
+
+// Boots by high-level emulation instead of running Nintendo's PIF boot ROM: leaves the CPU and the RCP as the boot
+// ROM would and starts the cart's own IPL3 in DMEM. Follows mupen64plus-core's src/device/pif/bootrom_hle.c
+// ("Copyright (C) 2016 Bobby Smiles", GPL-2.0-or-later) at commit a9ca8ec0b7decd17390c76c6341cf423d5d79321.
+// Expects reset_pif to have written the PIF RAM word at 0x24.
+pub fn boot_hle(device: &mut device::Device) {
+    // Register byte offsets within each interface's block.
+    const SP_STATUS: u64 = 4 * 4;
+    const PI_STATUS: u64 = 4 * 4;
+    const PI_BSD_DOM1_LAT: u64 = 5 * 4;
+    const PI_BSD_DOM1_PWD: u64 = 6 * 4;
+    const PI_BSD_DOM1_PGS: u64 = 7 * 4;
+    const PI_BSD_DOM1_RLS: u64 = 8 * 4;
+    const VI_V_INTR: u64 = 3 * 4;
+    const VI_CURRENT: u64 = 4 * 4;
+    const VI_H_START: u64 = 9 * 4;
+    const AI_DRAM_ADDR: u64 = 0;
+    const AI_LEN: u64 = 4;
+
+    device.cpu.cop0.regs[device::cop0::COP0_STATUS_REG] = 0x34000000;
+    device.cpu.cop0.regs[device::cop0::COP0_CONFIG_REG] = 0x7006e463;
+
+    // halt the RSP and clear its interrupt, reset the PI, blank the screen, mute the sound
+    device::rsp_interface::write_regs(device, SP_STATUS, 0x0a, u32::MAX);
+    device::pi::write_regs(device, PI_STATUS, 0x03, u32::MAX);
+    device::vi::write_regs(device, VI_V_INTR, 1023, u32::MAX);
+    device::vi::write_regs(device, VI_CURRENT, 0, u32::MAX);
+    device::vi::write_regs(device, VI_H_START, 0, u32::MAX);
+    device::ai::write_regs(device, AI_DRAM_ADDR, 0, u32::MAX);
+    device::ai::write_regs(device, AI_LEN, 0, u32::MAX);
+
+    // s3-s7, which the game's OS reads
+    let pif24 = u32::from_be_bytes(device.pif.ram[0x24..0x28].try_into().unwrap());
+    device.cpu.gpr[19] = u64::from((pif24 >> 19) & 0x01); // ROM type: 0 for a cart
+    device.cpu.gpr[20] = if device.cart.pal { 0 } else { 1 }; // TV type
+    device.cpu.gpr[21] = u64::from((pif24 >> 17) & 0x01); // reset type: 1 after a soft reset
+    device.cpu.gpr[22] = u64::from((pif24 >> 8) & 0xff); // CIC seed
+    device.cpu.gpr[23] = u64::from((pif24 >> 18) & 0x01);
+
+    // the cart's ROM timing, from its first word
+    let mut header = [0u8; 0x1000];
+    let available = device.cart.rom.len().min(header.len());
+    header[..available].copy_from_slice(&device.cart.rom[..available]);
+    let bsd_dom1_config = u32::from_be_bytes(header[0..4].try_into().unwrap());
+    device::pi::write_regs(device, PI_BSD_DOM1_LAT, bsd_dom1_config & 0xff, u32::MAX);
+    device::pi::write_regs(
+        device,
+        PI_BSD_DOM1_PWD,
+        (bsd_dom1_config >> 8) & 0xff,
+        u32::MAX,
+    );
+    device::pi::write_regs(
+        device,
+        PI_BSD_DOM1_PGS,
+        (bsd_dom1_config >> 16) & 0x0f,
+        u32::MAX,
+    );
+    device::pi::write_regs(
+        device,
+        PI_BSD_DOM1_RLS,
+        (bsd_dom1_config >> 20) & 0x03,
+        u32::MAX,
+    );
+
+    // the cart's IPL3, into DMEM
+    device.rsp.mem[0x40..0x1000].copy_from_slice(&header[0x40..0x1000]);
+
+    // What the boot ROM's IPL2 leaves at the start of IMEM, as bootrom_hle.c writes it ("required by CIC x105"). The
+    // CIC-6105 IPL3 checks these 32 bytes exactly: an equivalent instruction in place of one of them stops Ocarina of
+    // Time booting. Kept on the user's decision of 2026-11-10 (Rombie's .docs/licenses.md, legal question 14).
+    for (i, word) in [
+        0x3c0dbfc0u32,
+        0x8da807fc,
+        0x25ad07c0,
+        0x31080080,
+        0x5500fffc,
+        0x3c0dbfc0,
+        0x8da80024,
+        0x3c0bb000,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        device::rsp_interface::write_mem(device, 0x1000 + 4 * i as u64, word, u32::MAX);
+    }
+
+    device.cpu.gpr[11] = device::cpu_instructions::se32(0xa4000040u32 as i32); // t3
+    device.cpu.gpr[29] = device::cpu_instructions::se32(0xa4001ff0u32 as i32); // sp
+    device.cpu.gpr[31] = device::cpu_instructions::se32(0xa4001550u32 as i32); // ra
+    device.cpu.pc = device::cpu_instructions::se32(0xa4000040u32 as i32);
+    device.cpu.branch_state.state = device::cpu::State::Step;
 }
 
 pub fn init(device: &mut device::Device) {

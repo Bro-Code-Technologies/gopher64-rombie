@@ -231,10 +231,12 @@ bool sdl_event_filter(void *userdata, SDL_Event *event) {
       user_event.user.code = USER_EVENT_LOAD_STATE;
       SDL_PushEvent(&user_event);
       break;
+#ifdef GOPHER64_UPSTREAM_EXTRAS
     case SDL_SCANCODE_F8:
       if (messages.empty())
         SDL_RunOnMainThread(ra_display_inprogress_achievements, nullptr, false);
       break;
+#endif
     case SDL_SCANCODE_F9:
       display_challenge_indicator = !display_challenge_indicator;
       rdp_onscreen_message(

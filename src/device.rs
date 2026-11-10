@@ -107,6 +107,7 @@ pub fn run_game(
     rdp::init(device);
     vi::init(device);
     cpu::init(device);
+    pif::boot_hle(device);
 
     ui::storage::init(&mut device.ui, &device.cart.rom);
     ui::storage::load_saves(&mut device.ui, &mut device.netplay);
@@ -427,7 +428,6 @@ impl Device {
                 next_event: events::EVENT_TYPE_NONE,
             },
             pif: pif::Pif {
-                rom: [0; 1984],
                 ram: [0; 64],
                 channels: [pif::PifChannel {
                     tx: None,
