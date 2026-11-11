@@ -321,6 +321,9 @@ fn main() {
             env!("CARGO_PKG_VERSION"),
             String::from_utf8(git_output.stdout).unwrap()
         )
+    } else if let Ok(describe) = std::fs::read_to_string("rombie/GIT_DESCRIBE") {
+        // The Rombie engine's source archive has no .git; rombie/package.ps1 writes the commit's describe here.
+        describe.trim().to_string()
     } else {
         panic!("Failed to get git describe");
     };

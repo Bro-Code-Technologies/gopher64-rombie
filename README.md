@@ -1,3 +1,9 @@
+> **Modified version (2026-11-10).** This is a modified version of gopher64. Bro Code Technologies has changed it for
+> Rombie (https://rombie.app) since 2026-11-10, on the `rombie` branch: an engine mode with no window that Rombie's
+> page drives over a localhost WebSocket, a boot without Nintendo's PIF boot ROM, and an engine build that leaves
+> gopher64's netplay, RetroAchievements, web requests and cheats out. [docs/rombie/notes.md](docs/rombie/notes.md)
+> lists the changes with their dates.
+
 # gopher64
 Gopher64 is a cross-platform N64 emulator. Some notable features:
 * Netplay

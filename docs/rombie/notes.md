@@ -18,6 +18,19 @@ Pinned on 2026-11-10 (plan Phase 1).
 
 `upstream` is `https://github.com/gopher64/gopher64.git`.
 
+## Changes
+
+Bro Code Technologies' changes to gopher64 for Rombie, by date, as GPL-3.0 section 5a asks of a modified version. The
+README's notice at the top points here. Each change is in its own section below.
+
+| Date | Commit | Change |
+|---|---|---|
+| 2026-11-10 | `77ed00e` | These notes: the pinned source, the Windows build and the license scan (plan Phase 1) |
+| 2026-11-10 | `f14a41f` | The PIF boot ROM removed for an HLE boot; netplay, RetroAchievements, Discord, web requests, TLS and the cheat list left out of the engine build behind the `upstream-extras` feature; the speed log (Phase 2) |
+| 2026-11-10 | `d0e81f7` | Engine mode with no window: parallel-rdp on a Vulkan device with no surface, frames read back and sent with 48 kHz sound to a page over a localhost WebSocket, the page's pads on all four ports (Phase 3) |
+| 2026-11-10 | `eb3eda0` | The engine: launch modes and the `rombie-n64://` link, guarded connections, the boot from the page's ROM, pause, resume, exit and fast-forward, its own folder and log, no saves written, the version resource, and the release zip (Phase 4) |
+| 2026-11-10 | this table's commit | The Visual C++ runtime in the zip, the full source archive, the README's notice, and `build.rs` reading `rombie/GIT_DESCRIBE` in the archive (Phase 4.1) |
+
 ## Building (Windows)
 
 From upstream's `.github/workflows/build.yml` (`build-windows`), confirmed by the first builds on 2026-11-10 (plan
@@ -42,6 +55,9 @@ Phase 2):
 - The engine build: `cargo build --release --no-default-features --target=x86_64-pc-windows-msvc`, which gives
   `target\x86_64-pc-windows-msvc\release\gopher64.exe` (14.7 MB). From a fresh clone of `f14a41f` with its submodules,
   it took 2 minutes 6 seconds on the main PC (Ryzen 9 5950X).
+- From a release's source archive (`rombie-n64-engine-<version>-source.zip`): unzip it to a short path, then the same
+  build with `--offline`. Its `.cargo/config.toml` points cargo at the archive's `vendor` folder, and
+  `rombie/GIT_DESCRIBE` stands in for `git describe`, as the archive has no `.git`.
 
 ## What the engine build leaves out (plan Phase 2)
 
@@ -171,9 +187,23 @@ like Phase 2's speed test.
 
 ### Packaging
 
-`rombie/package.ps1` makes the release zip and `rombie/RELEASING.md` says how a release goes out. The zip holds
-`rombie-n64-engine.exe`, gopher64's `LICENSE` as `LICENSE.txt`, a `README.txt` naming the release's tag as the source,
-and `licenses\THIRD-PARTY.txt`:
+`rombie/package.ps1` makes a release's two files, from a clean tree, and `rombie/RELEASING.md` says how a release goes
+out. The download, `rombie-n64-engine-<version>-windows-x64.zip`, holds:
+
+- `rombie-n64-engine.exe`;
+- `msvcp140.dll` and `vcruntime140.dll`, the Visual C++ runtime the exe needs (`dumpbin /dependents`; its
+  `api-ms-win-crt-*` ones are Windows' own), from Visual Studio's redist for its toolset (14.42.34438 now), as the PS2
+  engine ships them (the user's choice, 2026-11-10);
+- gopher64's `LICENSE` as `LICENSE.txt`;
+- a `README.txt` with the modification notice, the source archive named as the source, and Microsoft's terms for the
+  runtime;
+- `licenses\THIRD-PARTY.txt`, below.
+
+The source, `rombie-n64-engine-<version>-source.zip` (GPL-3.0 section 6d), holds the commit's tree (`git archive`,
+so no PIF arrays), every submodule at its pinned commit, the crates from `cargo vendor` for `Cargo.lock`, the
+`.cargo/config.toml` lines that build from them offline, and `rombie/GIT_DESCRIBE`.
+
+`licenses\THIRD-PARTY.txt` holds:
 
 - the notices in `rombie/licenses/`: volk's and the Vulkan headers' (both from the submodule's headers, which carry no
   license file), X-Scale's (from mupen64plus-core's `n64_cic_nus_6105.c` at `a9ca8ec`), and Roboto Mono's, which is

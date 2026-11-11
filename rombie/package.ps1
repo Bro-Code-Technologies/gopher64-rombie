@@ -1,20 +1,25 @@
-# Builds the N64 engine's download: a zip with the engine, its license, the licenses of everything compiled into it
-# and a README. Run from the fork's root, in the build's environment (docs\rombie\notes.md, "Building (Windows)"),
-# after the engine build:
-#   powershell -File rombie\package.ps1 [-Out dist]
+# Builds the N64 engine's two release files: the download, a zip with the engine, the Visual C++ runtime, its license,
+# the licenses of everything compiled into it and a README; and the complete corresponding source, a zip of this
+# commit's tree with every submodule and the crates vendored for an offline build. Run from the fork's root, from a
+# clean tree, in the build's environment (docs\rombie\notes.md, "Building (Windows)"), after the engine build:
+#   powershell -File rombie\package.ps1 [-Out dist] [-SourceStage <short folder>]
+# The source is staged in a short folder, since SDL's sources in the vendored crates run deep.
 param(
-	[string]$Out = 'dist'
+	[string]$Out = 'dist',
+	[string]$SourceStage = (Join-Path $env:TEMP 'rn64-source')
 )
 $ErrorActionPreference = 'Stop'
 
+if (git status --porcelain) { throw 'The tree has changes. Commit them first, so the zips are this commit.' }
 $version = (Get-Content rombie\VERSION -TotalCount 1).Trim()
 $target = 'x86_64-pc-windows-msvc'
 $exe = "target\$target\release\gopher64.exe"
 $name = "rombie-n64-engine-$version-windows-x64"
+$sourceName = "rombie-n64-engine-$version-source"
 $stage = Join-Path $Out $name
 $zip = "$stage.zip"
-if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
-if (Test-Path $zip) { Remove-Item -Force $zip }
+$sourceZip = Join-Path $Out "$sourceName.zip"
+foreach ($path in $stage, $zip, $sourceZip, $SourceStage) { if (Test-Path $path) { Remove-Item -Recurse -Force $path } }
 New-Item -ItemType Directory -Force "$stage\licenses" | Out-Null
 
 # The engine build prints the engine's version; gopher64's own build has no --version of that kind.
@@ -22,6 +27,14 @@ $built = (& $exe --version | Out-String).Trim()
 if ($built -ne $version) { throw "$exe says '$built', not $version. Build it with --no-default-features first." }
 Copy-Item $exe "$stage\rombie-n64-engine.exe"
 Copy-Item LICENSE "$stage\LICENSE.txt"
+
+# The Visual C++ runtime the exe needs (dumpbin /dependents: msvcp140.dll and vcruntime140.dll; the api-ms-win-crt-*
+# ones are Windows' own), app-local, so nobody has to install the Visual C++ Redistributable first. Visual Studio's own
+# redist for its toolset, as the PS2 engine's package.ps1 takes it.
+$vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -version '[17,18)' -latest -property installationPath
+$redistVersion = (Get-Content "$vs\VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt").Trim()
+$crt = "$vs\VC\Redist\MSVC\$redistVersion\x64\Microsoft.VC143.CRT"
+foreach ($dll in 'msvcp140', 'vcruntime140') { Copy-Item "$crt\$dll.dll" $stage }
 
 $utf8 = New-Object System.Text.UTF8Encoding $false
 $rule = '=' * 78
@@ -83,6 +96,7 @@ foreach ($line in $crates) {
 }
 [IO.File]::WriteAllText((Join-Path (Resolve-Path $stage) 'licenses\THIRD-PARTY.txt'), $notices.ToString(), $utf8)
 
+$release = "https://github.com/Bro-Code-Technologies/gopher64-rombie/releases/tag/rombie-n64-engine-$version"
 $readme = @"
 Rombie N64 Engine $version
 
@@ -110,10 +124,57 @@ License
   The engine is free software under the GNU General Public License v3 (LICENSE.txt). It's built from gopher64
   (https://github.com/gopher64/gopher64). licenses\THIRD-PARTY.txt has the licenses of the libraries, crates, font
   and code it includes.
-  Source code: https://github.com/Bro-Code-Technologies/gopher64-rombie/tree/rombie-n64-engine-$version
+
+Modified version
+  This is a modified version of gopher64. Bro Code Technologies has changed it for Rombie since 2026-11-10: it adds an
+  engine mode with no window that Rombie's page drives over a local connection, boots games without Nintendo's PIF
+  boot ROM, and leaves gopher64's netplay, RetroAchievements, web requests and cheats out. docs/rombie/notes.md in the
+  source lists the changes with their dates.
+
+Source code
+  The complete source of this release is $sourceName.zip, on the same release page as this download:
+  $release
+  It builds this engine offline, with every submodule and crate it needs. The same commit is the tag
+  rombie-n64-engine-$version of https://github.com/Bro-Code-Technologies/gopher64-rombie.
+
+Microsoft files
+  msvcp140.dll and vcruntime140.dll (the Visual C++ runtime) are Microsoft's, distributed with the engine under the
+  Visual Studio 2022 license terms at https://visualstudio.microsoft.com/license-terms/vs2022-ga-community/. You may
+  use them only as part of the engine, and you may not modify, reverse engineer or distribute them separately.
+  Microsoft provides them as is, without any warranty, and is not liable for any damages arising from them.
 "@
 [IO.File]::WriteAllText((Join-Path (Resolve-Path $stage) 'README.txt'), ($readme -replace "`r?`n", "`r`n"), $utf8)
 
 Compress-Archive -Path $stage -DestinationPath $zip
 "{0} ({1:N1} MB), {2} crates" -f $zip, ((Get-Item $zip).Length / 1MB), $crates.Count
 if ($missing.Count) { "Crates with no license file (named with their authors instead): $($missing -join ', ')" }
+
+# The source: this commit's tree (it has no PIF arrays), every submodule at its pinned commit, the crates from
+# cargo vendor for Cargo.lock, and the .cargo/config.toml lines that build from them offline. The tree has no .git,
+# so rombie/GIT_DESCRIBE stands in for git describe (build.rs).
+$src = Join-Path $SourceStage $sourceName
+New-Item -ItemType Directory -Force $src | Out-Null
+$tar = Join-Path $SourceStage 'part.tar'
+git archive --format=tar -o $tar HEAD
+tar -xf $tar -C $src
+if ($LASTEXITCODE -ne 0) { throw 'Extracting the tree failed.' }
+foreach ($line in git submodule status --recursive) {
+	$path = ($line.Trim() -split '\s+')[1]
+	New-Item -ItemType Directory -Force (Join-Path $src $path) | Out-Null
+	git -C $path archive --format=tar -o $tar HEAD
+	tar -xf $tar -C (Join-Path $src $path)
+	if ($LASTEXITCODE -ne 0) { throw "Extracting the submodule $path failed." }
+}
+Remove-Item $tar
+[IO.File]::WriteAllText((Join-Path $src 'rombie\GIT_DESCRIBE'), (git describe --dirty).Trim() + "`n", $utf8)
+cargo vendor --locked (Join-Path $src 'vendor') | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'cargo vendor failed.' }
+$config = Join-Path $src '.cargo\config.toml'
+$offline = "`n# The source archive's crates (rombie/package.ps1), for an offline build.`n[source.crates-io]`nreplace-with = `"vendored-sources`"`n`n[source.vendored-sources]`ndirectory = `"vendor`"`n"
+[IO.File]::WriteAllText($config, ([IO.File]::ReadAllText($config)).TrimEnd() + "`n" + $offline, $utf8)
+$fullSourceZip = Join-Path (Resolve-Path $Out) "$sourceName.zip"
+tar -a -cf $fullSourceZip -C $SourceStage $sourceName
+if ($LASTEXITCODE -ne 0) { throw 'Zipping the source failed.' }
+Remove-Item -Recurse -Force $SourceStage
+"{0} ({1:N1} MB)" -f $sourceZip, ((Get-Item $sourceZip).Length / 1MB)
+foreach ($file in $zip, $sourceZip) { "SHA-256 {0} {1}" -f (Get-FileHash $file -Algorithm SHA256).Hash, (Split-Path $file -Leaf) }

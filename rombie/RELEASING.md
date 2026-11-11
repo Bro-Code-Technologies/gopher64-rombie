@@ -16,6 +16,7 @@ A person publishes the release. Nothing here is automated.
 | Git tag | `rombie-n64-engine-<version>` | `rombie-n64-engine-2026.0.0` |
 | Release name | `Rombie N64 Engine <version>` | `Rombie N64 Engine 2026.0.0` |
 | Zip (from `package.ps1`) | `rombie-n64-engine-<version>-windows-x64.zip` | `rombie-n64-engine-2026.0.0-windows-x64.zip` |
+| Source archive (from `package.ps1`) | `rombie-n64-engine-<version>-source.zip` | `rombie-n64-engine-2026.0.0-source.zip` |
 | Commit message | `Rombie N64 engine <version>: <what changed>` | `Rombie N64 engine 2026.0.0: first release` |
 
 Versions follow Rombie's other engines: `N` counts up through the year and goes back to 0 in January. Raise `N` when
@@ -52,15 +53,26 @@ one.
    cargo build --release --no-default-features --target=x86_64-pc-windows-msvc
    .\target\x86_64-pc-windows-msvc\release\gopher64.exe --version | Out-String   # must print the new version
    ```
-5. **Package** (from the fork's root, in the same environment, since it runs `cargo tree` and `cargo metadata`):
+5. **Package** (from the fork's root, in the same environment, since it runs `cargo tree`, `cargo metadata` and
+   `cargo vendor`):
    ```powershell
    powershell -File rombie\package.ps1
    ```
-   It writes `dist\rombie-n64-engine-<version>-windows-x64.zip` (about 5 MB), with the engine as
-   `rombie-n64-engine.exe`, gopher64's `LICENSE` as `LICENSE.txt`, a `README.txt` naming the release's tag as the
-   source, and `licenses\THIRD-PARTY.txt`: the notices in `rombie\licenses\`, parallel-rdp's, the C libraries the
-   crates build from source, and every crate the engine compiles with its license files. It stops if the exe isn't the
-   engine build of this version, and names any crate with no license file. `dist\` is not tracked by git.
+   It stops if the tree has changes, so both files are the commit you tag. It writes two files to `dist\`, which git
+   doesn't track, and prints their SHA-256s:
+   - `rombie-n64-engine-<version>-windows-x64.zip` (about 5 MB): the engine as `rombie-n64-engine.exe`,
+     `msvcp140.dll` and `vcruntime140.dll` from Visual Studio's redist for its toolset, gopher64's `LICENSE` as
+     `LICENSE.txt`, a `README.txt` (setup, the modification notice, the source archive, Microsoft's terms for the
+     runtime) and `licenses\THIRD-PARTY.txt`. That holds the notices in `rombie\licenses\`, parallel-rdp's, the C
+     libraries the crates build from source, and every crate the engine compiles with its license files. It stops if
+     the exe isn't the engine build of this version, and names any crate with no license file.
+   - `rombie-n64-engine-<version>-source.zip`: the complete corresponding source (GPL-3.0 section 6d). The commit's
+     tree, every submodule at its pinned commit, and the crates from `cargo vendor`, with the `.cargo/config.toml`
+     lines for an offline build. It's staged in a short folder under `%TEMP%`, since SDL's vendored sources run deep.
+
+   Check that the source has no PIF bytes: `src\device\pif\rom.rs` must be missing from it, and the first 16 bytes of
+   `NTSC_PIF_ROM` and of `PAL_PIF_ROM` (in upstream's `src/device/pif/rom.rs`, `git show
+   f05daaf:src/device/pif/rom.rs`) must appear in none of its files.
 6. **Try the zip the way a player would.** Unzip it into a new folder outside the build tree, then:
    - `.\rombie-n64-engine.exe --version | Out-String` prints the new version. The engine has no console window, so
      PowerShell only shows its output when it is piped, as here.
@@ -76,13 +88,14 @@ one.
 8. **Publish on GitHub.** Repository, Releases, Draft a new release:
    1. Choose the tag you just pushed.
    2. Release title: `Rombie N64 Engine <version>`.
-   3. Paste the description from the template below.
-   4. Attach `rombie-n64-engine-<version>-windows-x64.zip`.
+   3. Paste the description from the template below, with the two SHA-256s `package.ps1` printed.
+   4. Attach both `rombie-n64-engine-<version>-windows-x64.zip` and `rombie-n64-engine-<version>-source.zip`. The
+      download's `README.txt` names the source archive as its source, so the two always go out together.
    5. For a release that still needs staging: tick **Set as a pre-release**. Otherwise tick **Set as the latest
       release**.
    6. Publish release.
-9. **Check the release page.** The zip is attached with the right name, the tag points at the commit you meant, and
-   the download works. For a pre-release, also open `.../releases/latest` and confirm it did **not** change.
+9. **Check the release page.** Both zips are attached with the right names, the tag points at the commit you meant,
+   and the downloads work. For a pre-release, also open `.../releases/latest` and confirm it did **not** change.
 
 ## Promoting a pre-release to the official release
 
@@ -129,5 +142,11 @@ Setup details are in Rombie's Docs page.
 
 ### License and source
 
-The N64 engine is free software under the GNU GPL v3, as gopher64 is. The source for this release is the commit tagged `rombie-n64-engine-<version>` in this repository.
+The N64 engine is free software under the GNU GPL v3, as gopher64 is. It's a modified version of gopher64, changed by Bro Code Technologies for Rombie since 2026-11-10; `docs/rombie/notes.md` lists the changes. The complete source for this release is `rombie-n64-engine-<version>-source.zip` below, which builds the engine offline with every submodule and crate it needs. It's the commit tagged `rombie-n64-engine-<version>` in this repository.
+
+`msvcp140.dll` and `vcruntime140.dll` in the zip are Microsoft's Visual C++ runtime, distributed under the [Visual Studio 2022 license terms](https://visualstudio.microsoft.com/license-terms/vs2022-ga-community/).
+
+SHA-256:
+- `rombie-n64-engine-<version>-windows-x64.zip`: `<sha-256>`
+- `rombie-n64-engine-<version>-source.zip`: `<sha-256>`
 ```
