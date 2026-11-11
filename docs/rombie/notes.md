@@ -33,6 +33,7 @@ README's notice at the top points here. Each change is in its own section below.
 | 2026-11-10 | `e74ef10` and the commit after it | Game data and save states to and from the page, states only on the engine version that made them, and a separate queue for frames and sound (Phase 5) |
 | 2026-11-10 | the commit after `249c7b8` | With no page, the frame context flushes the RDP first, so a game whose page left stops instead of hanging (Phase 5) |
 | 2026-11-11 | the commit after `2f54a66` | Lockstep and netplay for Rombie's page: the page's input for each VI, the RNG and the cart clock pinned, full syncs waited for, the state's hashes, and a new RDP before a netplay load (Phase 6) |
+| 2026-11-11 | the commit after `a301767` | The log names the GPU in use (Phase 6) |
 
 ## Building (Windows)
 
@@ -244,7 +245,8 @@ hosts, joins or ends netplay in a running game. `src/rombie.rs`'s header has the
 - **No window.** `rdp_init` in `parallel-rdp/interface.cpp` takes a null window to mean engine mode: it creates
   Granite's Vulkan context and device with no surface and no WSI. With no surface to match, Granite takes the discrete
   GPU over an integrated one, so a two-GPU laptop runs on its GeForce. `GRANITE_VULKAN_DEVICE_INDEX=<n>` (Granite's
-  own) picks the nth GPU in the order the log lists them, for the Intel UHD run of Phase 6. SDL's video and TTF aren't
+  own) picks the nth GPU in the order the log lists them, for the Intel UHD run of Phase 6. Granite's "Found Vulkan
+  GPU" lines list every GPU, so the engine adds "Using Vulkan GPU" with the one it took. SDL's video and TTF aren't
   started, and on-screen messages are dropped.
 - **Frames.** At each VI, where the windowed build draws, `rdp_read_frame` reads parallel-rdp's scanout back at the
   VI's own size (`scanout_sync`, the same scanout options as the window) and `rombie::send_frame` sends it as RGBA,

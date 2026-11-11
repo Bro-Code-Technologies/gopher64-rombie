@@ -165,6 +165,8 @@ static bool init_headless() {
   }
   headless_device = Util::make_handle<Device>();
   headless_device->set_context(*headless_context);
+  // Granite names the GPU it picked only in debug builds, and on a two-GPU PC its "Found" lines list both.
+  LOGI("Using Vulkan GPU: %s\n", headless_device->get_gpu_properties().deviceName);
   return true;
 }
 
