@@ -36,9 +36,12 @@ Phase 2):
     names an MSVC without its x64 libraries, as on the main PC (14.38 without them, 14.43 complete): `VCToolsVersion`
     set to the complete one, which MSBuild reads. Otherwise SDL's CMake step stops at "No CMAKE_C_COMPILER could be
     found".
+- A short path for the checkout. SDL's build folders under `target\` run deep, and past Windows' 260-character limit
+  MSBuild's FileTracker can't write its logs, which also ends in "No CMAKE_C_COMPILER could be found".
 - `.cargo/config.toml` links with `rust-lld` and builds for `x86-64-v3`, so the engine needs a CPU with AVX2.
 - The engine build: `cargo build --release --no-default-features --target=x86_64-pc-windows-msvc`, which gives
-  `target\x86_64-pc-windows-msvc\release\gopher64.exe` (14.7 MB).
+  `target\x86_64-pc-windows-msvc\release\gopher64.exe` (14.7 MB). From a fresh clone of `f14a41f` with its submodules,
+  it took 2 minutes 6 seconds on the main PC (Ryzen 9 5950X).
 
 ## What the engine build leaves out (plan Phase 2)
 
