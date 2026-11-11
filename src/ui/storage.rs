@@ -208,6 +208,11 @@ pub fn init(ui: &mut ui::Ui, rom: &[u8]) {
 }
 
 pub fn load_saves(ui: &mut ui::Ui, netplay: &mut Option<netplay::Netplay>) {
+    // Rombie's engine mode: the saves are the page's game data, not files.
+    if crate::rombie::active() {
+        crate::rombie::load_game_data(&mut ui.storage.saves);
+        return;
+    }
     if netplay.is_none() || netplay.as_ref().unwrap().player_number == 0 {
         let eep = std::fs::read(&ui.storage.paths.eep_file_path);
         if let Ok(eep) = eep {
@@ -397,8 +402,9 @@ fn writeback_sdcard(device: &mut device::Device) {
 }
 
 pub fn write_saves(device: &mut device::Device) {
-    // Rombie's engine mode writes no game's saves to its folder; they stay in memory (Phase 5 sends them to the page).
+    // Rombie's engine mode writes no game's saves to its folder: the page gets them as the game data.
     if crate::rombie::active() {
+        crate::rombie::send_game_data(&mut device.ui.storage, false);
         return;
     }
     if device.netplay.is_none() || device.netplay.as_ref().unwrap().player_number == 0 {

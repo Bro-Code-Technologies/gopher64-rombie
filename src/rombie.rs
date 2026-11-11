@@ -16,14 +16,26 @@
 //!                   left, down, up, R, L; then the stick's x and y as signed bytes, +y up, at most 85 either way)
 //!   0x04 control    [u8 type][u8 op]                                         (1 pause, 2 resume, 3 exit)
 //!   0x05 ping       [u8 type][7 pad][f64 page time, ms]
+//!   0x06 save state [u8 type]                                                (answered with 0x84)
+//!   0x07 load state [u8 type][7 pad][state bytes]                            (answered with state-loaded or error)
+//!   0x08 game data  [u8 type][7 pad][blob]                                   (before boot; empty = a new game)
 //!   0x09 speed      [u8 type][3 pad][f32 ratio]                              (1 = normal; more = fast-forward, to 10)
 //! Engine to page (binary):
 //!   0x81 disc read  [u8 type][3 pad][u32 request id][u64 offset][u32 length]  (the ROM, read whole before the boot)
 //!   0x82 frame      [u8 type][3 pad][u32 frame no][f64 engine time, ms][u16 w][u16 h][u32 vi no][RGBA]
 //!   0x83 audio      [u8 type][3 pad][u32 frames][f32 stereo, interleaved, 48 kHz]
+//!   0x84 state      [u8 type][7 pad][state bytes]
+//!   0x85 game data  [u8 type][7 pad][blob]   (a second after the game last wrote its saves, before a pause, after a
+//!                                            state loads, and on exit ahead of "stopped")
 //! Engine to page (text, JSON): hello {"t":"hello","engine","version","protocol","gopher64"}, event
-//! {"t":"event","what","detail"} (booted, paused, resumed, speed, stopped, error), stats (once a second), and pong
-//! {"t":"pong","c":<page time>,"e":<engine time>}.
+//! {"t":"event","what","detail"} (booted, paused, resumed, speed, state-loaded, stopped, error), stats (once a second),
+//! and pong {"t":"pong","c":<page time>,"e":<engine time>}.
+//!
+//! The game data blob is the game's one stored object: "RN64", u32 version 1, then u32 lengths of the EEPROM, SRAM,
+//! FlashRAM and the four Controller Paks (each 0 or its full size: 2 KB, 32 KB, 128 KB, 4 x 32 KB), then those bytes.
+//! The cart's save is in it as the game's save type has it. A state is "RN64STAT", u32 version 1, the engine version
+//! and gopher64's build as u8-length strings, then gopher64's own state (its zip of the device, the saves with the
+//! Controller Paks, and parallel-rdp's state).
 //!
 //! One game per process: it boots when the page's boot message comes, and the process ends when the game stops.
 use crate::{device, ui};
@@ -61,10 +73,20 @@ const MSG_DISC_DATA: u8 = 0x02;
 const MSG_PAD: u8 = 0x03;
 const MSG_CONTROL: u8 = 0x04;
 const MSG_PING: u8 = 0x05;
+const MSG_SAVE_STATE: u8 = 0x06;
+const MSG_LOAD_STATE: u8 = 0x07;
+const MSG_GAME_DATA: u8 = 0x08;
 const MSG_SPEED: u8 = 0x09;
 const MSG_DISC_READ: u8 = 0x81;
 const MSG_FRAME: u8 = 0x82;
 const MSG_AUDIO: u8 = 0x83;
+const MSG_STATE: u8 = 0x84;
+const MSG_GAME_DATA_SAVED: u8 = 0x85;
+const GAME_DATA_MAGIC: &[u8; 4] = b"RN64";
+const GAME_DATA_VERSION: u32 = 1;
+const GAME_DATA_HEADER_SIZE: usize = 24;
+const STATE_MAGIC: &[u8; 8] = b"RN64STAT";
+const STATE_VERSION: u32 = 1;
 const CONTROL_PAUSE: u8 = 1;
 const CONTROL_RESUME: u8 = 2;
 const CONTROL_EXIT: u8 = 3;
@@ -98,8 +120,7 @@ static KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static IDLE: std::sync::Mutex<Option<(std::time::Instant, f64)>> = std::sync::Mutex::new(None);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 static BOOTED: AtomicBool = AtomicBool::new(false);
-static OUT: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Message>>> =
-    std::sync::Mutex::new(None);
+static OUT: std::sync::Mutex<Option<Outbox>> = std::sync::Mutex::new(None);
 static BOOT: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
 static GAME_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static DISC_REPLY: std::sync::Mutex<Option<(u32, std::sync::mpsc::Sender<Vec<u8>>)>> =
@@ -116,6 +137,28 @@ static AUDIO_PAUSED: AtomicBool = AtomicBool::new(true);
 static AUDIO_STOP: AtomicBool = AtomicBool::new(false);
 static AUDIO_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
     std::sync::Mutex::new(None);
+/// The page's game data for the boot (None: a new game), or that what it sent didn't parse.
+static GAME_DATA: std::sync::Mutex<Option<GameData>> = std::sync::Mutex::new(None);
+static GAME_DATA_BAD: AtomicBool = AtomicBool::new(false);
+static SAVE_STATE_WANTED: AtomicBool = AtomicBool::new(false);
+static STATE_TO_LOAD: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+/// The state being loaded, handed to gopher64's loader, and the engine version that made it.
+static LOADING_STATE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+static LOADING_STATE_VERSION: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static STATE_STARTED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// The page's two queues: frames and sound, which may be dropped, and everything else, which the writer sends first.
+struct Outbox {
+    media: tokio::sync::mpsc::Sender<Message>,
+    control: tokio::sync::mpsc::UnboundedSender<Message>,
+}
+
+struct GameData {
+    eeprom: Vec<u8>,
+    sram: Vec<u8>,
+    flash: Vec<u8>,
+    mempak: Vec<u8>,
+}
 
 /// Counters for the once-a-second stats line, taken and reset as it is sent.
 struct Stats {
@@ -178,10 +221,18 @@ fn add_timing(sum: &AtomicU64, max: &AtomicU64, started: std::time::Instant) {
     max.fetch_max(us, Relaxed);
 }
 
-fn send(message: Message) -> bool {
+/// Frames and sound: dropped when the page falls behind, so it gets the newer ones rather than a growing delay.
+fn send_media(message: Message) -> bool {
     match OUT.lock().unwrap().as_ref() {
-        Some(out) => out.try_send(message).is_ok(),
+        Some(out) => out.media.try_send(message).is_ok(),
         None => false,
+    }
+}
+
+/// Everything else, never dropped and in order: events, states, game data, disc reads.
+fn send(message: Message) {
+    if let Some(out) = OUT.lock().unwrap().as_ref() {
+        let _ = out.control.send(message);
     }
 }
 
@@ -427,17 +478,10 @@ fn run(mode: Mode, port: u16) -> i32 {
             reason: "stopped".into(),
         },
     )));
-    // Let the writer hand the last messages to the page before the process goes.
+    // Let the writer hand the last messages to the page, whose answer to the close ends the session, before the process
+    // goes.
     let started = std::time::Instant::now();
-    while started.elapsed() < std::time::Duration::from_secs(2) {
-        let drained = OUT
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_none_or(|out| out.capacity() == out.max_capacity());
-        if drained {
-            break;
-        }
+    while connected() && started.elapsed() < std::time::Duration::from_secs(2) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -699,21 +743,34 @@ async fn connection(mut stream: tokio::net::TcpStream) {
 /// One page, from its first message to its last.
 async fn session(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
     let (mut sink, mut source) = ws.split();
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(SEND_QUEUE);
-    let _ = out_tx.try_send(Message::Text(
+    let (media_tx, mut media_rx) = tokio::sync::mpsc::channel::<Message>(SEND_QUEUE);
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let _ = control_tx.send(Message::Text(
         format!(
             r#"{{"t":"hello","engine":"gopher64-rombie","version":"{VERSION}","protocol":{PROTOCOL},"gopher64":"{}"}}"#,
             env!("GIT_DESCRIBE")
         )
         .into(),
     ));
-    *OUT.lock().unwrap() = Some(out_tx.clone());
+    let stats_tx = control_tx.clone();
+    *OUT.lock().unwrap() = Some(Outbox {
+        media: media_tx,
+        control: control_tx,
+    });
     if BOOTED.load(Relaxed) {
         send_event("booted", &GAME_NAME.lock().unwrap().clone());
     }
 
     let writer = async move {
-        while let Some(message) = out_rx.recv().await {
+        loop {
+            let message = tokio::select! {
+                biased;
+                message = control_rx.recv() => message,
+                message = media_rx.recv() => message,
+            };
+            let Some(message) = message else {
+                break;
+            };
             let frame = matches!(&message, Message::Binary(b) if b.first() == Some(&MSG_FRAME));
             let started = std::time::Instant::now();
             match tokio::time::timeout(
@@ -735,7 +792,6 @@ async fn session(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) 
             }
         }
     };
-    let stats_tx = out_tx.clone();
     let stats = async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.tick().await;
@@ -743,7 +799,7 @@ async fn session(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) 
         loop {
             interval.tick().await;
             let now = std::time::Instant::now();
-            let _ = stats_tx.try_send(Message::Text(take_stats_json(now - last).into()));
+            let _ = stats_tx.send(Message::Text(take_stats_json(now - last).into()));
             last = now;
         }
     };
@@ -783,6 +839,12 @@ fn handle_message(data: &[u8]) {
             let name = String::from_utf8_lossy(&data[16..]).into_owned();
             if BOOTED.load(Relaxed) || BOOT.lock().unwrap().is_some() {
                 send_event("error", "A game is already running in this engine.");
+            } else if GAME_DATA_BAD.load(Relaxed) {
+                // Booting with fresh saves instead would send those back as the game's saves.
+                send_event(
+                    "error",
+                    "Boot failed: the game's stored data isn't N64 engine game data.",
+                );
             } else if !(MIN_ROM_SIZE..=MAX_ROM_SIZE).contains(&size) {
                 send_event("error", "That file is the wrong size for an N64 game.");
             } else {
@@ -827,6 +889,32 @@ fn handle_message(data: &[u8]) {
             };
             SPEED_BITS.store(speed.to_bits(), Relaxed);
             send_event("speed", &speed.to_string());
+        }
+        Some(&MSG_GAME_DATA) if data.len() >= 8 => {
+            if BOOTED.load(Relaxed) {
+                send_event("error", "The game data comes before the boot.");
+            } else if data.len() == 8 {
+                *GAME_DATA.lock().unwrap() = None;
+                GAME_DATA_BAD.store(false, Relaxed);
+            } else {
+                let parsed = parse_game_data(&data[8..]);
+                GAME_DATA_BAD.store(parsed.is_none(), Relaxed);
+                if parsed.is_none() {
+                    send_event(
+                        "error",
+                        "The game's stored data isn't N64 engine game data.",
+                    );
+                }
+                *GAME_DATA.lock().unwrap() = parsed;
+            }
+        }
+        Some(&MSG_SAVE_STATE) if BOOTED.load(Relaxed) => {
+            *STATE_STARTED.lock().unwrap() = Some(std::time::Instant::now());
+            SAVE_STATE_WANTED.store(true, Relaxed);
+        }
+        Some(&MSG_LOAD_STATE) if data.len() > 8 && BOOTED.load(Relaxed) => {
+            *STATE_STARTED.lock().unwrap() = Some(std::time::Instant::now());
+            *STATE_TO_LOAD.lock().unwrap() = Some(data[8..].to_vec());
         }
         _ => {}
     }
@@ -873,15 +961,19 @@ pub fn pad(port: usize) -> u32 {
     PADS[port].load(Relaxed)
 }
 
-/// At each VI, after the frame: holds the game while the page has it paused. True if it paused, so the pace starts
-/// again from now.
-pub fn pause_point() -> bool {
+/// At each VI, after the frame: serves the page's save state requests, and holds the game while the page has it paused,
+/// serving them meanwhile. True if it paused, so the pace starts again from now.
+pub fn at_vi(device: &mut device::Device) -> bool {
+    serve_states(device);
     if !PAUSE_WANTED.load(Relaxed) || !keep_running() {
         return false;
     }
+    // A save the game wrote just before the pause shouldn't wait for the game to resume.
+    ui::storage::write_saves(device);
     EMU_PAUSED.store(true, Relaxed);
     send_event("paused", "");
     while PAUSE_WANTED.load(Relaxed) && keep_running() {
+        serve_states(device);
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     EMU_PAUSED.store(false, Relaxed);
@@ -889,6 +981,191 @@ pub fn pause_point() -> bool {
         send_event("resumed", "");
     }
     true
+}
+
+/// gopher64's own state code, at a VI rather than where its hotkeys run it (a VI origin write), so a paused game can
+/// save and load too.
+fn serve_states(device: &mut device::Device) {
+    if SAVE_STATE_WANTED.swap(false, Relaxed) {
+        crate::savestates::create_savestate(device, false, None);
+    }
+    let load = STATE_TO_LOAD.lock().unwrap().take();
+    if let Some(bytes) = load {
+        match parse_state(&bytes) {
+            Some((version, state)) => {
+                *LOADING_STATE_VERSION.lock().unwrap() = version;
+                *LOADING_STATE.lock().unwrap() = Some(state);
+                crate::savestates::load_savestate(device, false, None);
+            }
+            None => send_event("error", "That isn't an N64 engine save state."),
+        }
+    }
+}
+
+fn parse_state(bytes: &[u8]) -> Option<(String, Vec<u8>)> {
+    let rest = bytes.strip_prefix(STATE_MAGIC)?;
+    if u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) != STATE_VERSION {
+        return None;
+    }
+    let mut at = 4;
+    let mut texts = Vec::new();
+    for _ in 0..2 {
+        let len = *rest.get(at)? as usize;
+        texts.push(String::from_utf8_lossy(rest.get(at + 1..at + 1 + len)?).into_owned());
+        at += 1 + len;
+    }
+    Some((texts.swap_remove(0), rest[at..].to_vec()))
+}
+
+fn state_ms() -> u128 {
+    STATE_STARTED
+        .lock()
+        .unwrap()
+        .take()
+        .map_or(0, |started| started.elapsed().as_millis())
+}
+
+/// From gopher64's state code: the state it made, sent to the page behind the engine's header.
+pub fn state_saved(state: Option<Vec<u8>>) {
+    let Some(state) = state else {
+        send_event("error", "Saving the state failed.");
+        return;
+    };
+    let mut message = vec![0u8; 8];
+    message[0] = MSG_STATE;
+    message.extend_from_slice(STATE_MAGIC);
+    message.extend_from_slice(&STATE_VERSION.to_le_bytes());
+    for text in [VERSION, env!("GIT_DESCRIBE")] {
+        message.push(text.len() as u8);
+        message.extend_from_slice(text.as_bytes());
+    }
+    message.extend_from_slice(&state);
+    eprintln!(
+        "rombie: state saved, {} bytes in {} ms",
+        message.len() - 8,
+        state_ms()
+    );
+    send(Message::Binary(message.into()));
+}
+
+/// For gopher64's state loader, in place of its file: the state the page sent.
+pub fn take_state() -> Option<Vec<u8>> {
+    LOADING_STATE.lock().unwrap().take()
+}
+
+/// From gopher64's state loader. A state carries the saves, so the page gets the game data the engine now holds.
+pub fn state_loaded(loaded: bool, storage: &mut ui::Storage) {
+    let version = LOADING_STATE_VERSION.lock().unwrap().clone();
+    if loaded {
+        eprintln!("rombie: state loaded in {} ms", state_ms());
+        send_event("state-loaded", &version);
+        send_game_data(storage, true);
+    } else {
+        state_ms();
+        send_event(
+            "error",
+            &format!(
+                "The save state didn't load. It's from N64 engine {version}, and this is {VERSION}."
+            ),
+        );
+    }
+}
+
+fn parse_game_data(blob: &[u8]) -> Option<GameData> {
+    if blob.len() < GAME_DATA_HEADER_SIZE
+        || &blob[..4] != GAME_DATA_MAGIC
+        || u32::from_le_bytes(blob[4..8].try_into().unwrap()) != GAME_DATA_VERSION
+    {
+        return None;
+    }
+    let sizes = [
+        device::cart::EEPROM_MAX_SIZE,
+        device::cart::sram::SRAM_SIZE,
+        device::cart::sram::FLASHRAM_SIZE,
+        device::controller::mempak::MEMPAK_SIZE * 4,
+    ];
+    let mut parts = Vec::new();
+    let mut at = GAME_DATA_HEADER_SIZE;
+    for (i, size) in sizes.iter().enumerate() {
+        let len = u32::from_le_bytes(blob[8 + i * 4..12 + i * 4].try_into().unwrap()) as usize;
+        if len != 0 && len != *size {
+            return None;
+        }
+        parts.push(blob.get(at..at + len)?.to_vec());
+        at += len;
+    }
+    if at != blob.len() {
+        return None;
+    }
+    let mut parts = parts.into_iter();
+    Some(GameData {
+        eeprom: parts.next()?,
+        sram: parts.next()?,
+        flash: parts.next()?,
+        mempak: parts.next()?,
+    })
+}
+
+/// In place of gopher64's save files: the page's game data, before gopher64 formats what's missing.
+pub fn load_game_data(saves: &mut ui::storage::Saves) {
+    if let Some(data) = GAME_DATA.lock().unwrap().take() {
+        saves.eeprom.data = data.eeprom;
+        saves.sram.data = data.sram;
+        saves.flash.data = data.flash;
+        saves.mempak.data = data.mempak;
+    }
+}
+
+/// In place of writing gopher64's save files: the game data to the page, if the game wrote any (or always, when
+/// forced). It holds the cart's save as the game's save type has it, and the four Controller Paks.
+pub fn send_game_data(storage: &mut ui::Storage, force: bool) {
+    let saves = &mut storage.saves;
+    let pending = saves.eeprom.write_pending
+        || saves.sram.write_pending
+        || saves.flash.write_pending
+        || saves.mempak.write_pending;
+    if !pending && !force {
+        return;
+    }
+    let types = &storage.save_type;
+    let has = |kinds: &[ui::storage::SaveTypes]| kinds.iter().any(|kind| types.contains(kind));
+    let parts: [&[u8]; 4] = [
+        if has(&[
+            ui::storage::SaveTypes::Eeprom4k,
+            ui::storage::SaveTypes::Eeprom16k,
+        ]) {
+            &saves.eeprom.data
+        } else {
+            &[]
+        },
+        if has(&[ui::storage::SaveTypes::Sram]) {
+            &saves.sram.data
+        } else {
+            &[]
+        },
+        if has(&[ui::storage::SaveTypes::Flash]) {
+            &saves.flash.data
+        } else {
+            &[]
+        },
+        &saves.mempak.data,
+    ];
+    let mut message = vec![0u8; 8];
+    message[0] = MSG_GAME_DATA_SAVED;
+    message.extend_from_slice(GAME_DATA_MAGIC);
+    message.extend_from_slice(&GAME_DATA_VERSION.to_le_bytes());
+    for part in parts {
+        message.extend_from_slice(&(part.len() as u32).to_le_bytes());
+    }
+    for part in parts {
+        message.extend_from_slice(part);
+    }
+    saves.eeprom.write_pending = false;
+    saves.sram.write_pending = false;
+    saves.flash.write_pending = false;
+    saves.mempak.write_pending = false;
+    eprintln!("rombie: game data sent, {} bytes", message.len() - 8);
+    send(Message::Binary(message.into()));
 }
 
 /// At each VI: the moment the windowed build would draw the frame. Reads it back and queues it.
@@ -926,7 +1203,7 @@ pub fn send_frame(frame_time: f64) {
     STATS.grabbed.fetch_add(1, Relaxed);
     STATS.width.store(width, Relaxed);
     STATS.height.store(height, Relaxed);
-    if !send(Message::Binary(message.into())) {
+    if !send_media(Message::Binary(message.into())) {
         STATS.dropped.fetch_add(1, Relaxed);
     }
 }
@@ -987,7 +1264,7 @@ pub fn start_audio(stream: *mut sdl3_sys::audio::SDL_AudioStream) {
                 samples[got.min(bytes)..].fill(0);
             }
             message[4..8].copy_from_slice(&(frames as u32).to_le_bytes());
-            send(Message::Binary(
+            send_media(Message::Binary(
                 message[..AUDIO_HEADER_SIZE + bytes].to_vec().into(),
             ));
             frames_done += frames;

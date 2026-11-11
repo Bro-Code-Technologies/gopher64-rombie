@@ -175,6 +175,11 @@ pub fn create_savestate(device: &mut device::Device, rewind: bool, rewind_frame:
             } else {
                 None
             };
+            if crate::rombie::active() {
+                // Rombie's engine mode: the state goes to the page, not to a file.
+                crate::rombie::state_saved(compressed_file);
+                return;
+            }
             if let Some(compressed_file) = compressed_file {
                 if let Err(e) = tokio::fs::write(save_path, compressed_file).await {
                     eprintln!("Error writing savestate: {}", e);
@@ -233,8 +238,12 @@ pub fn load_savestate(device: &mut device::Device, rewind: bool, rewind_frame: O
         } else {
             None
         }
-    } else if let Ok(savestate) = std::fs::read(&device.ui.storage.paths.savestate_file_path)
-        && let Ok(device_data) = ui::storage::decompress_file(&savestate, "device")
+    } else if let Some(savestate) = if crate::rombie::active() {
+        // Rombie's engine mode: the state the page sent, not a file.
+        crate::rombie::take_state()
+    } else {
+        std::fs::read(&device.ui.storage.paths.savestate_file_path).ok()
+    } && let Ok(device_data) = ui::storage::decompress_file(&savestate, "device")
         && let Ok(saves_data) = ui::storage::decompress_file(&savestate, "saves")
         && let Ok(rdp_state) = ui::storage::decompress_file(&savestate, "rdp_state")
         && let Ok(ra_state) = ui::storage::decompress_file(&savestate, "ra_state")
@@ -360,6 +369,10 @@ pub fn load_savestate(device: &mut device::Device, rewind: bool, rewind_frame: O
             cheats::execute_cheats(device, device.cheats.cheats.clone());
         }
 
+        if crate::rombie::active() {
+            crate::rombie::state_loaded(true, &mut device.ui.storage);
+        }
+
         if !rewind {
             ui::video::onscreen_message(
                 &format!(
@@ -370,6 +383,9 @@ pub fn load_savestate(device: &mut device::Device, rewind: bool, rewind_frame: O
             );
         }
     } else {
+        if crate::rombie::active() {
+            crate::rombie::state_loaded(false, &mut device.ui.storage);
+        }
         let (message, length) = if !rewind {
             (
                 format!(

@@ -147,7 +147,7 @@ pub fn update_screen(device: &mut device::Device) {
         let _ = device.ui.video.vis_tx.as_ref().unwrap().send(true);
     }
 
-    if crate::rombie::active() && crate::rombie::pause_point() {
+    if crate::rombie::active() && crate::rombie::at_vi(device) {
         reset_pace_deadline(device);
     }
 
