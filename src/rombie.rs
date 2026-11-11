@@ -50,7 +50,8 @@
 //!                                                                      input is in)
 //! Engine to page (text, JSON): hello {"t":"hello","engine","version","protocol","gopher64"}, event
 //! {"t":"event","what","detail"} (booted, paused, resumed, speed, state-loaded, state-version, netplay, stopped, error),
-//! stats (once a second; "lw" is the ms it waited for lockstep input), and pong {"t":"pong","c":<page time>,"e":<engine
+//! stats (once a second; "lw" is the ms it waited for lockstep input, "fs" for the GPU's full syncs in lockstep, "idle"
+//! the ms the speed limiter slept, "hash" the ms spent hashing), and pong {"t":"pong","c":<page time>,"e":<engine
 //! time>}.
 //!
 //! The game data blob is the game's one stored object: "RN64", u32 version 1, then u32 lengths of the EEPROM, SRAM,
@@ -235,6 +236,9 @@ struct Stats {
     audio_frames: AtomicU64,
     audio_underruns: AtomicU32,
     lockstep_wait_us: AtomicU64,
+    full_sync_us: AtomicU64,
+    idle_us: AtomicU64,
+    hash_us: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -252,6 +256,9 @@ static STATS: Stats = Stats {
     audio_frames: AtomicU64::new(0),
     audio_underruns: AtomicU32::new(0),
     lockstep_wait_us: AtomicU64::new(0),
+    full_sync_us: AtomicU64::new(0),
+    idle_us: AtomicU64::new(0),
+    hash_us: AtomicU64::new(0),
 };
 
 pub fn active() -> bool {
@@ -934,19 +941,20 @@ fn handle_message(data: &[u8]) {
             }
             let flags = data[1];
             let year = u16::from_le_bytes(data[8..10].try_into().unwrap());
-            let clock = chrono::NaiveDate::from_ymd_opt(year as i32, data[10] as u32, data[11] as u32)
-                .and_then(|date| date.and_hms_opt(data[12] as u32, data[13] as u32, data[14] as u32))
-                .map(|time| time.and_utc().timestamp());
+            let clock =
+                chrono::NaiveDate::from_ymd_opt(year as i32, data[10] as u32, data[11] as u32)
+                    .and_then(|date| {
+                        date.and_hms_opt(data[12] as u32, data[13] as u32, data[14] as u32)
+                    })
+                    .map(|time| time.and_utc().timestamp());
             UNTHROTTLED.store(flags & LOCKSTEP_UNTHROTTLED != 0, Relaxed);
             *LOCKSTEP_BOOT.lock().unwrap() = None;
             if flags & LOCKSTEP_ON != 0 {
                 match clock {
                     Some(clock) => {
                         *LOCKSTEP_BOOT.lock().unwrap() = Some(clock);
-                        LOCKSTEP_EVERY.store(
-                            u32::from_le_bytes(data[4..8].try_into().unwrap()),
-                            Relaxed,
-                        );
+                        LOCKSTEP_EVERY
+                            .store(u32::from_le_bytes(data[4..8].try_into().unwrap()), Relaxed);
                     }
                     None => send_event("error", "That lockstep clock isn't a date and time."),
                 }
@@ -1042,7 +1050,7 @@ fn take_stats_json(window: std::time::Duration) -> String {
     let readback_us = STATS.readback_us.swap(0, Relaxed);
     let send_us = STATS.send_us.swap(0, Relaxed);
     format!(
-        r#"{{"t":"stats","ms":{:.0},"vi":{},"grab":{},"sent":{},"drop":{},"w":{},"h":{},"hz":{:.3},"speed":{},"rb":{:.2},"rbMax":{:.2},"send":{:.2},"sendMax":{:.2},"af":{},"au":{},"lw":{:.1}}}"#,
+        r#"{{"t":"stats","ms":{:.0},"vi":{},"grab":{},"sent":{},"drop":{},"w":{},"h":{},"hz":{:.3},"speed":{},"rb":{:.2},"rbMax":{:.2},"send":{:.2},"sendMax":{:.2},"af":{},"au":{},"lw":{:.1},"fs":{:.1},"idle":{:.1},"hash":{:.1}}}"#,
         window.as_secs_f64() * 1000.0,
         STATS.vis.swap(0, Relaxed),
         grabbed,
@@ -1067,7 +1075,22 @@ fn take_stats_json(window: std::time::Duration) -> String {
         STATS.audio_frames.swap(0, Relaxed),
         STATS.audio_underruns.swap(0, Relaxed),
         STATS.lockstep_wait_us.swap(0, Relaxed) as f64 / 1000.0,
+        STATS.full_sync_us.swap(0, Relaxed) as f64 / 1000.0,
+        STATS.idle_us.swap(0, Relaxed) as f64 / 1000.0,
+        STATS.hash_us.swap(0, Relaxed) as f64 / 1000.0,
     )
+}
+
+/// The stats' `"fs"`: time the game waited in lockstep for the GPU to finish a full sync.
+pub fn add_full_sync_time(started: std::time::Instant) {
+    STATS
+        .full_sync_us
+        .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+}
+
+/// The stats' `"idle"`: time the speed limiter slept, which is how far ahead of the clock the PC is.
+pub fn add_idle_time(slept: std::time::Duration) {
+    STATS.idle_us.fetch_add(slept.as_micros() as u64, Relaxed);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1123,9 +1146,16 @@ pub fn at_vi_start(device: &mut device::Device) {
     let vi = LOCKSTEP_VI.fetch_add(1, Relaxed);
     let every = LOCKSTEP_EVERY.load(Relaxed);
     if every != 0 && vi.is_multiple_of(every) {
+        let started = std::time::Instant::now();
         // The RDP writes RDRAM on the GPU, behind the game; what it was given has to be in before RDRAM is hashed.
         ui::video::idle();
         let hashes = hash_state(device);
+        STATS
+            .hash_us
+            .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+        if vi / every < 3 {
+            dump_rdram(device, vi);
+        }
         let mut message = vec![0u8; 12];
         message[0] = MSG_HASHES;
         message[4..8].copy_from_slice(&vi.to_le_bytes());
@@ -1166,8 +1196,24 @@ pub fn at_vi_start(device: &mut device::Device) {
     }
 }
 
+/// A development flag for finding where two PCs' RDRAM differs: with `ROMBIE_DUMP_RDRAM` naming a folder, the first
+/// three hashed VIs' RDRAM goes there as `<game>-<VI>.bin`.
+fn dump_rdram(device: &device::Device, vi: u32) {
+    let Some(folder) = std::env::var_os("ROMBIE_DUMP_RDRAM") else {
+        return;
+    };
+    let name = format!("{}-{vi}.bin", ui::storage::get_game_name(&device.cart.rom));
+    let path = std::path::Path::new(&folder).join(name);
+    if let Err(e) = std::fs::write(&path, &device.rdram.mem) {
+        eprintln!("rombie: couldn't write {}: {e}", path.display());
+    }
+}
+
 fn drop_inputs_before(inputs: &mut std::collections::BTreeMap<u32, [u32; 4]>, vi: u32) {
-    while inputs.first_key_value().is_some_and(|(&first, _)| first < vi) {
+    while inputs
+        .first_key_value()
+        .is_some_and(|(&first, _)| first < vi)
+    {
         inputs.pop_first();
     }
 }
@@ -1199,7 +1245,10 @@ fn netplay(device: &mut device::Device, op: NetplayOp) {
             };
             HOSTING.store(false, Relaxed);
             if state.is_empty() || !load_netplay_state(device, state) {
-                send_event("error", "Hosting failed: the state didn't save and load back.");
+                send_event(
+                    "error",
+                    "Hosting failed: the state didn't save and load back.",
+                );
                 return;
             }
         }
@@ -1228,7 +1277,11 @@ fn netplay(device: &mut device::Device, op: NetplayOp) {
     LOCKSTEP.store(true, Relaxed);
     send_event(
         "netplay",
-        if op.op == NETPLAY_HOST { "host" } else { "join" },
+        if op.op == NETPLAY_HOST {
+            "host"
+        } else {
+            "join"
+        },
     );
 }
 
@@ -1398,7 +1451,10 @@ pub fn take_state() -> Option<Vec<u8>> {
 pub fn state_loaded(loaded: bool, storage: &mut ui::Storage) {
     LOAD_OK.store(loaded, Relaxed);
     if NETPLAY_LOAD.load(Relaxed) {
-        eprintln!("rombie: netplay state loaded ({loaded}) in {} ms", state_ms());
+        eprintln!(
+            "rombie: netplay state loaded ({loaded}) in {} ms",
+            state_ms()
+        );
         return;
     }
     let version = LOADING_STATE_VERSION.lock().unwrap().clone();

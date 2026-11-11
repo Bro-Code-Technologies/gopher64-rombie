@@ -34,6 +34,7 @@ README's notice at the top points here. Each change is in its own section below.
 | 2026-11-10 | the commit after `249c7b8` | With no page, the frame context flushes the RDP first, so a game whose page left stops instead of hanging (Phase 5) |
 | 2026-11-11 | the commit after `2f54a66` | Lockstep and netplay for Rombie's page: the page's input for each VI, the RNG and the cart clock pinned, full syncs waited for, the state's hashes, and a new RDP before a netplay load (Phase 6) |
 | 2026-11-11 | the commit after `a301767` | The log names the GPU in use (Phase 6) |
+| 2026-11-11 | the commit after `38ab61f` | The full-sync wait, the speed limiter's sleep and the hashing timed in the stats, and RDRAM dumps for the lockstep checks (Phase 6) |
 
 ## Building (Windows)
 
@@ -231,6 +232,10 @@ hosts, joins or ends netplay in a running game. `src/rombie.rs`'s header has the
   in the first try). So both sides drop parallel-rdp's command processor and make a new one
   (`rdp_reset_processor` in `parallel-rdp/interface.cpp`) before loading. After that, a replay from the state matched
   its recording at every VI. pcsx2-rombie reboots at a handoff instead; the N64 needs only the new RDP.
+- **For the checks.** The stats line also carries `"fs"`, the ms the game waited for full syncs, `"idle"`, the ms the
+  speed limiter slept (how far ahead of the clock the PC is), and `"hash"`, the ms spent hashing. With
+  `ROMBIE_DUMP_RDRAM` naming a folder, the RDRAM of the first three hashed VIs goes there as `<game>-<VI>.bin`, to find
+  where two PCs' RDRAM differs.
 - **On the main PC** (Ryzen 9 5950X, RTX 5070 Ti), with Rombie's `engine/n64/lockstep-test.html`: a ten-minute
   recording (35,896 VIs) each of four-player Mario Kart 64 and Super Smash Bros., four players of scripted input after
   an opening played from boot. Each recording hosts netplay where its input starts, so its replays join from the

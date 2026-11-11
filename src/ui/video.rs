@@ -332,7 +332,9 @@ pub fn process_rdp_list() -> u64 {
     let timer = unsafe { rdp_process_commands() };
     // Rombie's lockstep: a full sync done before the game goes on, the same on every PC (interface.cpp says why).
     if crate::rombie::lockstep() {
+        let started = std::time::Instant::now();
         unsafe { rdp_finish_commands() }
+        crate::rombie::add_full_sync_time(started);
     }
     timer
 }

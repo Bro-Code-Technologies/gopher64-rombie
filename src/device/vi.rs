@@ -238,6 +238,9 @@ fn speed_limiter(device: &mut device::Device) {
             if now < deadline {
                 let dur = deadline - now;
                 spin_sleep::sleep(dur);
+                if crate::rombie::active() {
+                    crate::rombie::add_idle_time(now.elapsed());
+                }
 
                 if dur < device.speed_limiter.min_wait_time {
                     device.speed_limiter.min_wait_time = dur;
