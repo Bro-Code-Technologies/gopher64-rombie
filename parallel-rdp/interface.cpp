@@ -369,6 +369,32 @@ void rdp_idle() {
   rdram_dirty.assign(gfx_info.RDRAM_SIZE >> 3, false);
 }
 
+// Rombie's lockstep, after each batch of commands: a full sync waited for at once, as parallel-rdp's synchronous mode
+// does elsewhere, so the RDP is done before the game hears it is. gopher64 instead waits only when the game touches
+// RDRAM its tracking marks as the RDP's, and RDRAM the tracking missed could then hold what the GPU had or hadn't
+// drawn yet, which depends on the PC. Waiting after every batch instead was 12 times slower. With sync_signal cleared,
+// the tracking never waits; what it has marked stays marked, which costs one needless wait after lockstep ends.
+void rdp_finish_commands() {
+  if (sync_signal) {
+    processor->wait_for_timeline(sync_signal);
+    sync_signal = 0;
+  }
+}
+
+static void rdp_new_processor();
+
+// Rombie's netplay, before a state loads: a new RDP, the same on every PC. A state doesn't carry the RDP's own
+// registers (tiles, combiner, the color image), so an engine that had run the game a while drew on differently from
+// the same state than one just booted, until the game set them again.
+void rdp_reset_processor() {
+  if (!processor)
+    return;
+  processor->idle();
+  delete processor;
+  processor = nullptr;
+  rdp_new_processor();
+}
+
 static void rdp_new_processor() {
   RDP::CommandProcessorFlags flags =
       RDP::COMMAND_PROCESSOR_FLAG_HOST_VISIBLE_HIDDEN_RDRAM_BIT |

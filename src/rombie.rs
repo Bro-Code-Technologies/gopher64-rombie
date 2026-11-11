@@ -21,6 +21,22 @@
 //!                                                                             state-version: made on another version)
 //!   0x08 game data  [u8 type][7 pad][blob]                                   (before boot; empty = a new game)
 //!   0x09 speed      [u8 type][3 pad][f32 ratio]                              (1 = normal; more = fast-forward, to 10)
+//!   0x0B lockstep   [u8 type][u8 flags][2 pad][u32 hash every][u16 year][u8 month][u8 day][u8 hour][u8 minute]
+//!                   [u8 second][u8 pad]
+//!                   (before boot. flags: 1 on, 2 unthrottled. On, VI N runs only once the page has sent VI N's input
+//!                   with 0x0C, pad messages are ignored, and what could differ between two PCs is pinned: the cart's
+//!                   clock starts at the time given and reads as UTC, and the RNG gopher64 times its PI and SI
+//!                   interrupts with starts from a fixed seed. Fast-forward is ignored. Unthrottled runs as fast as the
+//!                   input comes, for tests; 2 alone keeps it for a later join. Every <hash every> VIs (0 = never) the
+//!                   engine sends 0x86. VI 0 is the first after the boot.)
+//!   0x0C inputs     [u8 type][3 pad][u32 first VI][u32 count][count x 4 ports x u32 pad word, as 0x03's]
+//!   0x0D netplay    [u8 type][u8 op][2 pad][u32 VI][u32 hash every][state bytes, op 2 only]
+//!                   (a running game, done at its next VI and never while paused, so every PC does it at the same
+//!                   point, between two instructions. Op 1 host: send the game data if the game changed it (0x85) and
+//!                   the state (0x84), then load that state back, as the guests do. Op 2 join: load the state that
+//!                   follows, one this engine version made (state-version otherwise). Both then go into lockstep from
+//!                   <VI> as 0x0B describes, the clock as UTC, hashing every <hash every> VIs. Op 3 end: lockstep off,
+//!                   and 0x03 pads play again. Each answers with the event "netplay", detail host, join or end.)
 //! Engine to page (binary):
 //!   0x81 disc read  [u8 type][3 pad][u32 request id][u64 offset][u32 length]  (the ROM, read whole before the boot)
 //!   0x82 frame      [u8 type][3 pad][u32 frame no][f64 engine time, ms][u16 w][u16 h][u32 vi no][RGBA]
@@ -28,9 +44,14 @@
 //!   0x84 state      [u8 type][7 pad][state bytes]
 //!   0x85 game data  [u8 type][7 pad][blob]   (a second after the game last wrote its saves, before a pause, after a
 //!                                            state loads, and on exit ahead of "stopped")
+//!   0x86 hashes     [u8 type][3 pad][u32 VI][u32 count][count x u64]  (lockstep: FxHash of the emulated state at the
+//!                   start of that VI, before its input: RDRAM, CPU, RSP, RCP registers, PIF, cart, saves, caches, RNG)
+//!   0x87 VI         [u8 type][3 pad][u32 VI]                          (lockstep: that VI is next, and runs once its
+//!                                                                      input is in)
 //! Engine to page (text, JSON): hello {"t":"hello","engine","version","protocol","gopher64"}, event
-//! {"t":"event","what","detail"} (booted, paused, resumed, speed, state-loaded, state-version, stopped, error), stats (once a second),
-//! and pong {"t":"pong","c":<page time>,"e":<engine time>}.
+//! {"t":"event","what","detail"} (booted, paused, resumed, speed, state-loaded, state-version, netplay, stopped, error),
+//! stats (once a second; "lw" is the ms it waited for lockstep input), and pong {"t":"pong","c":<page time>,"e":<engine
+//! time>}.
 //!
 //! The game data blob is the game's one stored object: "RN64", u32 version 1, then u32 lengths of the EEPROM, SRAM,
 //! FlashRAM and the four Controller Paks (each 0 or its full size: 2 KB, 32 KB, 128 KB, 4 x 32 KB), then those bytes.
@@ -78,11 +99,23 @@ const MSG_SAVE_STATE: u8 = 0x06;
 const MSG_LOAD_STATE: u8 = 0x07;
 const MSG_GAME_DATA: u8 = 0x08;
 const MSG_SPEED: u8 = 0x09;
+const MSG_LOCKSTEP: u8 = 0x0B;
+const MSG_INPUTS: u8 = 0x0C;
+const MSG_NETPLAY: u8 = 0x0D;
 const MSG_DISC_READ: u8 = 0x81;
 const MSG_FRAME: u8 = 0x82;
 const MSG_AUDIO: u8 = 0x83;
 const MSG_STATE: u8 = 0x84;
 const MSG_GAME_DATA_SAVED: u8 = 0x85;
+const MSG_HASHES: u8 = 0x86;
+const MSG_VI: u8 = 0x87;
+const LOCKSTEP_ON: u8 = 1;
+const LOCKSTEP_UNTHROTTLED: u8 = 2;
+const NETPLAY_HOST: u8 = 1;
+const NETPLAY_JOIN: u8 = 2;
+const NETPLAY_END: u8 = 3;
+/// The RNG's seed in lockstep from boot: any fixed value does, the same on every PC.
+const LOCKSTEP_SEED: u64 = 0x524F_4D42_4945_3634;
 const GAME_DATA_MAGIC: &[u8; 4] = b"RN64";
 const GAME_DATA_VERSION: u32 = 1;
 const GAME_DATA_HEADER_SIZE: usize = 24;
@@ -147,6 +180,31 @@ static STATE_TO_LOAD: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(
 static LOADING_STATE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
 static LOADING_STATE_VERSION: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 static STATE_STARTED: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+/// Lockstep: each VI waits for the page's input for it. LOCKSTEP_VI is the next VI's number.
+static LOCKSTEP: AtomicBool = AtomicBool::new(false);
+static UNTHROTTLED: AtomicBool = AtomicBool::new(false);
+static LOCKSTEP_EVERY: AtomicU32 = AtomicU32::new(0);
+static LOCKSTEP_VI: AtomicU32 = AtomicU32::new(0);
+/// From 0x0B before the boot: lockstep from the first VI, with the cart clock starting here (Unix seconds, as UTC).
+static LOCKSTEP_BOOT: std::sync::Mutex<Option<i64>> = std::sync::Mutex::new(None);
+static UTC_CLOCK: AtomicBool = AtomicBool::new(false);
+static INPUTS: std::sync::Mutex<std::collections::BTreeMap<u32, [u32; 4]>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static INPUTS_IN: std::sync::Condvar = std::sync::Condvar::new();
+static NETPLAY_OP: std::sync::Mutex<Option<NetplayOp>> = std::sync::Mutex::new(None);
+/// While hosting, the state the host saved, kept to load it back.
+static HOSTING: AtomicBool = AtomicBool::new(false);
+static HOST_STATE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+/// A netplay load answers with "netplay", not "state-loaded", and sends no game data: the saves are the host's.
+static NETPLAY_LOAD: AtomicBool = AtomicBool::new(false);
+static LOAD_OK: AtomicBool = AtomicBool::new(false);
+
+struct NetplayOp {
+    op: u8,
+    vi: u32,
+    every: u32,
+    state: Vec<u8>,
+}
 
 /// The page's two queues: frames and sound, which may be dropped, and everything else, which the writer sends first.
 struct Outbox {
@@ -176,6 +234,7 @@ struct Stats {
     send_max_us: AtomicU64,
     audio_frames: AtomicU64,
     audio_underruns: AtomicU32,
+    lockstep_wait_us: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -192,6 +251,7 @@ static STATS: Stats = Stats {
     send_max_us: AtomicU64::new(0),
     audio_frames: AtomicU64::new(0),
     audio_underruns: AtomicU32::new(0),
+    lockstep_wait_us: AtomicU64::new(0),
 };
 
 pub fn active() -> bool {
@@ -263,6 +323,9 @@ fn idle_overrun() -> bool {
 }
 
 fn speed() -> f32 {
+    if LOCKSTEP.load(Relaxed) {
+        return 1.0;
+    }
     f32::from_bits(SPEED_BITS.load(Relaxed))
 }
 
@@ -860,13 +923,65 @@ fn handle_message(data: &[u8]) {
                 let _ = tx.send(data[8..].to_vec());
             }
         }
-        Some(&MSG_PAD) if data.len() >= 8 && data[1] < 4 => {
+        Some(&MSG_PAD) if data.len() >= 8 && data[1] < 4 && !LOCKSTEP.load(Relaxed) => {
             let word = u32::from_le_bytes(data[4..8].try_into().unwrap());
-            let stick = |v: u32| (v as u8 as i8).clamp(-MAX_STICK, MAX_STICK) as u8 as u32;
-            PADS[data[1] as usize].store(
-                (word & PAD_BUTTONS) | stick(word >> 16) << 16 | stick(word >> 24) << 24,
-                Relaxed,
-            );
+            PADS[data[1] as usize].store(pad_word(word), Relaxed);
+        }
+        Some(&MSG_LOCKSTEP) if data.len() >= 16 => {
+            if BOOTED.load(Relaxed) || BOOT.lock().unwrap().is_some() {
+                send_event("error", "Lockstep comes before the boot.");
+                return;
+            }
+            let flags = data[1];
+            let year = u16::from_le_bytes(data[8..10].try_into().unwrap());
+            let clock = chrono::NaiveDate::from_ymd_opt(year as i32, data[10] as u32, data[11] as u32)
+                .and_then(|date| date.and_hms_opt(data[12] as u32, data[13] as u32, data[14] as u32))
+                .map(|time| time.and_utc().timestamp());
+            UNTHROTTLED.store(flags & LOCKSTEP_UNTHROTTLED != 0, Relaxed);
+            *LOCKSTEP_BOOT.lock().unwrap() = None;
+            if flags & LOCKSTEP_ON != 0 {
+                match clock {
+                    Some(clock) => {
+                        *LOCKSTEP_BOOT.lock().unwrap() = Some(clock);
+                        LOCKSTEP_EVERY.store(
+                            u32::from_le_bytes(data[4..8].try_into().unwrap()),
+                            Relaxed,
+                        );
+                    }
+                    None => send_event("error", "That lockstep clock isn't a date and time."),
+                }
+            }
+        }
+        Some(&MSG_INPUTS) if data.len() >= 12 => {
+            let first = u32::from_le_bytes(data[4..8].try_into().unwrap());
+            let count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+            if data.len() != 12 + count * 16 {
+                return;
+            }
+            let mut inputs = INPUTS.lock().unwrap();
+            for (i, frame) in data[12..].as_chunks::<16>().0.iter().enumerate() {
+                let mut pads = [0u32; 4];
+                for (pad, word) in pads.iter_mut().zip(frame.as_chunks::<4>().0) {
+                    *pad = pad_word(u32::from_le_bytes(*word));
+                }
+                inputs.insert(first.wrapping_add(i as u32), pads);
+            }
+            INPUTS_IN.notify_all();
+        }
+        Some(&MSG_NETPLAY) if data.len() >= 12 => {
+            let op = data[1];
+            if !BOOTED.load(Relaxed) {
+                send_event("error", "Netplay needs a running game.");
+            } else if matches!(op, NETPLAY_HOST | NETPLAY_END)
+                || (op == NETPLAY_JOIN && data.len() > 12)
+            {
+                *NETPLAY_OP.lock().unwrap() = Some(NetplayOp {
+                    op,
+                    vi: u32::from_le_bytes(data[4..8].try_into().unwrap()),
+                    every: u32::from_le_bytes(data[8..12].try_into().unwrap()),
+                    state: data[12..].to_vec(),
+                });
+            }
         }
         Some(&MSG_CONTROL) if data.len() >= 2 => match data[1] {
             CONTROL_PAUSE => PAUSE_WANTED.store(true, Relaxed),
@@ -927,7 +1042,7 @@ fn take_stats_json(window: std::time::Duration) -> String {
     let readback_us = STATS.readback_us.swap(0, Relaxed);
     let send_us = STATS.send_us.swap(0, Relaxed);
     format!(
-        r#"{{"t":"stats","ms":{:.0},"vi":{},"grab":{},"sent":{},"drop":{},"w":{},"h":{},"hz":{:.3},"speed":{},"rb":{:.2},"rbMax":{:.2},"send":{:.2},"sendMax":{:.2},"af":{},"au":{}}}"#,
+        r#"{{"t":"stats","ms":{:.0},"vi":{},"grab":{},"sent":{},"drop":{},"w":{},"h":{},"hz":{:.3},"speed":{},"rb":{:.2},"rbMax":{:.2},"send":{:.2},"sendMax":{:.2},"af":{},"au":{},"lw":{:.1}}}"#,
         window.as_secs_f64() * 1000.0,
         STATS.vis.swap(0, Relaxed),
         grabbed,
@@ -951,6 +1066,7 @@ fn take_stats_json(window: std::time::Duration) -> String {
         STATS.send_max_us.swap(0, Relaxed) as f64 / 1000.0,
         STATS.audio_frames.swap(0, Relaxed),
         STATS.audio_underruns.swap(0, Relaxed),
+        STATS.lockstep_wait_us.swap(0, Relaxed) as f64 / 1000.0,
     )
 }
 
@@ -960,6 +1076,218 @@ fn take_stats_json(window: std::time::Duration) -> String {
 /// The port's pad word, as the page last sent it.
 pub fn pad(port: usize) -> u32 {
     PADS[port].load(Relaxed)
+}
+
+/// A page's pad word with only the N64's buttons, and the stick no further than a real one goes.
+fn pad_word(word: u32) -> u32 {
+    let stick = |v: u32| (v as u8 as i8).clamp(-MAX_STICK, MAX_STICK) as u8 as u32;
+    (word & PAD_BUTTONS) | stick(word >> 16) << 16 | stick(word >> 24) << 24
+}
+
+/// gopher64's own netplay shares these two between its PCs; lockstep from boot pins them instead.
+pub fn pin_rng_rtc(rng: &mut rand::rngs::Xoshiro256PlusPlus, rtc_timestamp: &mut i64) {
+    use rand::SeedableRng;
+    if let Some(clock) = *LOCKSTEP_BOOT.lock().unwrap() {
+        *rng = rand::rngs::Xoshiro256PlusPlus::seed_from_u64(LOCKSTEP_SEED);
+        *rtc_timestamp = clock;
+        LOCKSTEP_VI.store(0, Relaxed);
+        UTC_CLOCK.store(true, Relaxed);
+        LOCKSTEP.store(true, Relaxed);
+    }
+}
+
+/// In lockstep the cart's clock reads as UTC, the same on every PC whatever its time zone.
+pub fn utc_clock() -> bool {
+    UTC_CLOCK.load(Relaxed)
+}
+
+pub fn lockstep() -> bool {
+    LOCKSTEP.load(Relaxed)
+}
+
+/// Lockstep for tests: as fast as the input comes, with no pacing.
+pub fn unthrottled() -> bool {
+    LOCKSTEP.load(Relaxed) && UNTHROTTLED.load(Relaxed)
+}
+
+/// At the start of each VI, between two instructions, before the game sees it: a netplay op waiting for it, then in
+/// lockstep the state's hashes, the VI announced, and its input, waited for.
+pub fn at_vi_start(device: &mut device::Device) {
+    let op = NETPLAY_OP.lock().unwrap().take();
+    if let Some(op) = op {
+        netplay(device, op);
+    }
+    if !LOCKSTEP.load(Relaxed) {
+        return;
+    }
+    let vi = LOCKSTEP_VI.fetch_add(1, Relaxed);
+    let every = LOCKSTEP_EVERY.load(Relaxed);
+    if every != 0 && vi.is_multiple_of(every) {
+        // The RDP writes RDRAM on the GPU, behind the game; what it was given has to be in before RDRAM is hashed.
+        ui::video::idle();
+        let hashes = hash_state(device);
+        let mut message = vec![0u8; 12];
+        message[0] = MSG_HASHES;
+        message[4..8].copy_from_slice(&vi.to_le_bytes());
+        message[8..12].copy_from_slice(&(hashes.len() as u32).to_le_bytes());
+        for hash in hashes {
+            message.extend_from_slice(&hash.to_le_bytes());
+        }
+        send(Message::Binary(message.into()));
+    }
+    let mut message = vec![0u8; 8];
+    message[0] = MSG_VI;
+    message[4..8].copy_from_slice(&vi.to_le_bytes());
+    send(Message::Binary(message.into()));
+
+    let started = std::time::Instant::now();
+    let mut inputs = INPUTS.lock().unwrap();
+    let pads = loop {
+        if let Some(pads) = inputs.remove(&vi) {
+            break Some(pads);
+        }
+        if !keep_running() {
+            break None;
+        }
+        inputs = INPUTS_IN
+            .wait_timeout(inputs, std::time::Duration::from_millis(5))
+            .unwrap()
+            .0;
+    };
+    drop_inputs_before(&mut inputs, vi);
+    drop(inputs);
+    STATS
+        .lockstep_wait_us
+        .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    if let Some(pads) = pads {
+        for (port, pad) in pads.into_iter().enumerate() {
+            PADS[port].store(pad, Relaxed);
+        }
+    }
+}
+
+fn drop_inputs_before(inputs: &mut std::collections::BTreeMap<u32, [u32; 4]>, vi: u32) {
+    while inputs.first_key_value().is_some_and(|(&first, _)| first < vi) {
+        inputs.pop_first();
+    }
+}
+
+fn netplay(device: &mut device::Device, op: NetplayOp) {
+    match op.op {
+        NETPLAY_END => {
+            LOCKSTEP.store(false, Relaxed);
+            INPUTS.lock().unwrap().clear();
+            send_event("netplay", "end");
+            return;
+        }
+        NETPLAY_HOST => {
+            send_game_data(&mut device.ui.storage, false);
+            *STATE_STARTED.lock().unwrap() = Some(std::time::Instant::now());
+            HOST_STATE.lock().unwrap().take();
+            HOSTING.store(true, Relaxed);
+            crate::savestates::create_savestate(device, false, None);
+            // The state is compressed on another thread; the game waits here for it.
+            let started = std::time::Instant::now();
+            let state = loop {
+                if let Some(state) = HOST_STATE.lock().unwrap().take() {
+                    break state;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(30) {
+                    break Vec::new();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            HOSTING.store(false, Relaxed);
+            if state.is_empty() || !load_netplay_state(device, state) {
+                send_event("error", "Hosting failed: the state didn't save and load back.");
+                return;
+            }
+        }
+        NETPLAY_JOIN => match parse_state(&op.state) {
+            Some((version, _)) if version != VERSION => {
+                send_event("state-version", &version);
+                return;
+            }
+            Some((_, state)) => {
+                if !load_netplay_state(device, state) {
+                    send_event("error", "Joining failed: the state didn't load.");
+                    return;
+                }
+            }
+            None => {
+                send_event("error", "That isn't an N64 engine save state.");
+                return;
+            }
+        },
+        _ => return,
+    }
+    LOCKSTEP_VI.store(op.vi, Relaxed);
+    LOCKSTEP_EVERY.store(op.every, Relaxed);
+    drop_inputs_before(&mut INPUTS.lock().unwrap(), op.vi);
+    UTC_CLOCK.store(true, Relaxed);
+    LOCKSTEP.store(true, Relaxed);
+    send_event(
+        "netplay",
+        if op.op == NETPLAY_HOST { "host" } else { "join" },
+    );
+}
+
+fn load_netplay_state(device: &mut device::Device, state: Vec<u8>) -> bool {
+    *LOADING_STATE_VERSION.lock().unwrap() = VERSION.to_string();
+    *LOADING_STATE.lock().unwrap() = Some(state);
+    LOAD_OK.store(false, Relaxed);
+    NETPLAY_LOAD.store(true, Relaxed);
+    ui::video::reset_rdp();
+    crate::savestates::load_savestate(device, false, None);
+    NETPLAY_LOAD.store(false, Relaxed);
+    LOAD_OK.load(Relaxed)
+}
+
+/// The emulated state in parts, for comparing PCs. The TLB's lookup maps are left out: they follow from the TLB, and
+/// their order depends on how they grew, which differs after a state loads.
+fn hash_state(device: &mut device::Device) -> [u64; 9] {
+    use std::hash::Hasher;
+    fn hash(parts: &[&[u8]]) -> u64 {
+        let mut hasher = rustc_hash::FxHasher::default();
+        for part in parts {
+            hasher.write(part);
+        }
+        hasher.finish()
+    }
+    fn serialized<T: serde::Serialize>(value: &T) -> u64 {
+        hash(&[&postcard::to_stdvec(value).unwrap_or_default()])
+    }
+    let lut_r = std::mem::take(&mut device.cpu.cop0.tlb_lut_r);
+    let lut_w = std::mem::take(&mut device.cpu.cop0.tlb_lut_w);
+    let cpu = serialized(&device.cpu);
+    device.cpu.cop0.tlb_lut_r = lut_r;
+    device.cpu.cop0.tlb_lut_w = lut_w;
+    let saves = &device.ui.storage.saves;
+    [
+        hash(&[&device.rdram.mem]),
+        cpu,
+        serialized(&device.rsp),
+        serialized(&(
+            &device.rdp,
+            &device.mi,
+            &device.pi,
+            &device.vi,
+            &device.ai,
+            &device.si,
+            &device.ri,
+            &device.rdram.regs,
+        )),
+        serialized(&device.pif),
+        serialized(&device.cart),
+        hash(&[
+            &saves.eeprom.data,
+            &saves.sram.data,
+            &saves.flash.data,
+            &saves.mempak.data,
+        ]),
+        serialized(&device.memory),
+        serialized(&device.rng),
+    ]
 }
 
 /// At each VI, after the frame: serves the page's save state requests, and holds the game while the page has it paused,
@@ -1035,9 +1363,15 @@ fn state_ms() -> u128 {
 /// From gopher64's state code: the state it made, sent to the page behind the engine's header.
 pub fn state_saved(state: Option<Vec<u8>>) {
     let Some(state) = state else {
+        if HOSTING.load(Relaxed) {
+            *HOST_STATE.lock().unwrap() = Some(Vec::new());
+        }
         send_event("error", "Saving the state failed.");
         return;
     };
+    if HOSTING.load(Relaxed) {
+        *HOST_STATE.lock().unwrap() = Some(state.clone());
+    }
     let mut message = vec![0u8; 8];
     message[0] = MSG_STATE;
     message.extend_from_slice(STATE_MAGIC);
@@ -1062,6 +1396,11 @@ pub fn take_state() -> Option<Vec<u8>> {
 
 /// From gopher64's state loader. A state carries the saves, so the page gets the game data the engine now holds.
 pub fn state_loaded(loaded: bool, storage: &mut ui::Storage) {
+    LOAD_OK.store(loaded, Relaxed);
+    if NETPLAY_LOAD.load(Relaxed) {
+        eprintln!("rombie: netplay state loaded ({loaded}) in {} ms", state_ms());
+        return;
+    }
     let version = LOADING_STATE_VERSION.lock().unwrap().clone();
     if loaded {
         eprintln!("rombie: state loaded in {} ms", state_ms());

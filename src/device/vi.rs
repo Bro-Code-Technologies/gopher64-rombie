@@ -136,6 +136,7 @@ pub fn update_screen(device: &mut device::Device) {
             .frame_counter
             .is_multiple_of(device.speed_limiter.limit_freq)
         && device.speed_limiter.enabled
+        && !crate::rombie::unthrottled()
     {
         speed_limiter(device);
     }
@@ -166,6 +167,9 @@ pub fn update_screen(device: &mut device::Device) {
 }
 
 pub fn vertical_interrupt_event(device: &mut device::Device) {
+    if crate::rombie::active() {
+        crate::rombie::at_vi_start(device);
+    }
     device.vi.elapsed_time += device.vi.frame_time;
 
     if device.cheats.enabled {

@@ -161,6 +161,9 @@ fn init_rng_rtc(device: &mut Device) {
             device.cart.rtc_timestamp = netplay::receive_rtc(netplay);
         }
     }
+    if crate::rombie::active() {
+        crate::rombie::pin_rng_rtc(&mut device.rng, &mut device.cart.rtc_timestamp);
+    }
 }
 
 pub fn swap_rom(contents: Vec<u8>) -> Option<Vec<u8>> {

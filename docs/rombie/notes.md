@@ -32,6 +32,7 @@ README's notice at the top points here. Each change is in its own section below.
 | 2026-11-10 | `10d1b24` and the commit after it | The Visual C++ runtime in the zip, the full source archive, the README's notice, and `build.rs` reading `rombie/GIT_DESCRIBE` in the archive (Phase 4.1) |
 | 2026-11-10 | `e74ef10` and the commit after it | Game data and save states to and from the page, states only on the engine version that made them, and a separate queue for frames and sound (Phase 5) |
 | 2026-11-10 | the commit after `249c7b8` | With no page, the frame context flushes the RDP first, so a game whose page left stops instead of hanging (Phase 5) |
+| 2026-11-11 | the commit after `2f54a66` | Lockstep and netplay for Rombie's page: the page's input for each VI, the RNG and the cart clock pinned, full syncs waited for, the state's hashes, and a new RDP before a netplay load (Phase 6) |
 
 ## Building (Windows)
 
@@ -159,11 +160,13 @@ like Phase 2's speed test.
   stick's x and y as signed bytes, +y up, clamped to 85 either way.
 - **Pong** is pcsx2-rombie's: `{"t":"pong","c":<page time>,"e":<engine time>}`.
 - **Events**: booted (with the ROM's name, sent again to a page that comes back), paused, resumed, speed,
-  state-loaded, state-version, stopped and error. After "stopped" the engine closes the connection normally (1000,
-  "stopped") and exits.
+  state-loaded, state-version, netplay, stopped and error. After "stopped" the engine closes the connection normally
+  (1000, "stopped") and exits.
 - **Queues**: frames and sound go in a small queue that drops them when the page falls behind; everything else
   (events, states, game data, disc reads) in an unbounded one the writer serves first, so nothing of it is lost.
-- **Not yet**: lockstep (Phase 6).
+- **Lockstep** (below) counts VIs where pcsx2-rombie counts vsyncs. `0x0C` carries four pad words a VI, as `0x03`
+  has them, not PS2's buttons and four axes. `0x0D` has no multitap byte; the byte is padding. `0x86` has nine FxHash
+  parts, not ten XXH3 ones.
 
 ### Game data and save states (plan Phase 5)
 
@@ -190,6 +193,51 @@ answered with `0x84`, `0x07` load state answered with the event "state-loaded" (
   the version that made it, and isn't loaded, as the Xbox engine refuses one. Rombie shows "Made on" for such a slot.
 - **Sizes and times** on the main PC, measured at the page: Super Mario 64's state 1.07 MB and Ocarina of Time's 1.72
   MB, saved in 52 to 87 ms and loaded in 30 to 54 ms, the engine's own part 25 to 49 ms.
+
+### Lockstep and netplay (plan Phase 6)
+
+pcsx2-rombie's messages, counted in VIs: `0x0B` before the boot puts a game in lockstep from its first VI, and `0x0D`
+hosts, joins or ends netplay in a running game. `src/rombie.rs`'s header has their layouts.
+
+- **The lockstep point** is the start of `vertical_interrupt_event` (`src/device/vi.rs`): every VI, between two
+  instructions, before the game sees the VI. There `rombie::at_vi_start` runs a netplay op waiting for it, then in
+  lockstep hashes the state (every Nth VI), sends `0x87` with the VI's number, and waits for that VI's input. Input for
+  VIs already run is dropped. The time spent waiting goes into the stats as `"lw"`.
+- **What's pinned.** gopher64's own netplay shares the RNG's seed and the cart clock's start between its PCs
+  (`init_rng_rtc`); lockstep pins them instead. The RNG, which times the PI and SI interrupts, starts from a fixed seed;
+  the cart clock starts at `0x0B`'s time and reads as UTC (`time2data` in `src/device/cart.rs`), so a time zone makes no
+  difference. Fast-forward is ignored, and so are `0x03` pads: the only input is `0x0C`'s.
+- **Unthrottled** (`0x0B`'s flag 2) skips gopher64's speed limiter, so a test replays a recording as fast as the PC
+  runs it.
+- **Hashes.** Nine FxHash parts, each of the device as a save state serializes it: RDRAM, CPU, RSP, RCP registers (RDP,
+  MI, PI, VI, AI, SI, RI and RDRAM's), PIF, cart, saves, caches and RNG. The CPU's leaves out the TLB's lookup maps:
+  they follow from the TLB, and their order depends on how they grew, which differs after a state loads. parallel-rdp
+  writes RDRAM from its own thread, so the RDP is idled (`ui::video::idle`) before hashing. Without that, RDRAM hashed
+  at the same VI differed between two runs.
+- **Full syncs waited for.** gopher64 lets the GPU draw while the game runs on, and waits for it only when the game
+  touches RDRAM its tracking marks as the RDP's (`rdp_check_framebuffers`). In the first ten-minute runs, one Mario
+  Kart 64 run of three differed from the other two in RDRAM alone, at VIs 2136 to 2141, then matched again: one frame
+  drawn differently, until its buffer was drawn over. The CPU and the rest matched throughout, so the game never read
+  it, but a game that reads its frame buffer would have gone its own way. In lockstep, `rdp_finish_commands` waits for
+  a full sync as soon as its batch of commands is in, as parallel-rdp's synchronous mode does in other emulators.
+  Waiting after every batch instead ran Mario Kart 64 at 8 VIs a second flat out, 12 times slower.
+- **Netplay ops** run at the VI they name, never while paused. The host sends its game data, saves a state at that VI
+  and loads it again, so both start from the same bytes; the joiner loads the host's state, which must be from this engine version ("state-version"
+  otherwise). Both then run in lockstep from that VI, with the clock as UTC. A netplay load sends neither
+  "state-loaded" nor game data: the saves are the host's.
+- **A new RDP before every netplay load.** A save state holds parallel-rdp's own state but not all of its RDP's: an
+  engine that had just booted, joining a host's state, differed from the host in RDRAM from the next VI (6 of 57 VIs
+  in the first try). So both sides drop parallel-rdp's command processor and make a new one
+  (`rdp_reset_processor` in `parallel-rdp/interface.cpp`) before loading. After that, a replay from the state matched
+  its recording at every VI. pcsx2-rombie reboots at a handoff instead; the N64 needs only the new RDP.
+- **On the main PC** (Ryzen 9 5950X, RTX 5070 Ti), with Rombie's `engine/n64/lockstep-test.html`: a ten-minute
+  recording (35,896 VIs) each of four-player Mario Kart 64 and Super Smash Bros., four players of scripted input after
+  an opening played from boot. Each recording hosts netplay where its input starts, so its replays join from the
+  host's state, as a netplay guest does. Replayed flat out and in real time with the full-sync wait, all nine hashes
+  matched the recording's at every VI: 0 of 35,897 differ, in all four replays. Flat out, Mario Kart 64 ran at 168% of
+  the VIs due (127% in its slowest 30 seconds) and Super Smash Bros. at 156% (136%). In real time both held 100%
+  (99.95% and 99.94% in the slowest 30 seconds). RDRAM's hash changed at every VI, so the games were playing, not
+  stuck on a screen.
 
 ### What the engine is, whatever the config says
 

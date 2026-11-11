@@ -231,6 +231,11 @@ pub fn idle() {
     unsafe { rdp_idle() }
 }
 
+/// Rombie's netplay: a new RDP before a state loads (interface.cpp says why).
+pub fn reset_rdp() {
+    unsafe { rdp_reset_processor() }
+}
+
 pub fn load_state(device: &mut device::Device, rdp_state: *const u8, rdp_state_len: usize) {
     let gfx_info = build_gfx_info(device, device.netplay.is_some());
     unsafe {
@@ -324,7 +329,12 @@ pub fn set_register(reg: u32, value: u32) {
 }
 
 pub fn process_rdp_list() -> u64 {
-    unsafe { rdp_process_commands() }
+    let timer = unsafe { rdp_process_commands() };
+    // Rombie's lockstep: a full sync done before the game goes on, the same on every PC (interface.cpp says why).
+    if crate::rombie::lockstep() {
+        unsafe { rdp_finish_commands() }
+    }
+    timer
 }
 
 pub fn check_framebuffers(address: u32, length: u32) {
