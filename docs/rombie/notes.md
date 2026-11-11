@@ -30,6 +30,7 @@ README's notice at the top points here. Each change is in its own section below.
 | 2026-11-10 | `d0e81f7` | Engine mode with no window: parallel-rdp on a Vulkan device with no surface, frames read back and sent with 48 kHz sound to a page over a localhost WebSocket, the page's pads on all four ports (Phase 3) |
 | 2026-11-10 | `eb3eda0` | The engine: launch modes and the `rombie-n64://` link, guarded connections, the boot from the page's ROM, pause, resume, exit and fast-forward, its own folder and log, no saves written, the version resource, and the release zip (Phase 4) |
 | 2026-11-10 | `10d1b24` and the commit after it | The Visual C++ runtime in the zip, the full source archive, the README's notice, and `build.rs` reading `rombie/GIT_DESCRIBE` in the archive (Phase 4.1) |
+| 2026-11-10 | `e74ef10` and the commit after it | Game data and save states to and from the page, states only on the engine version that made them, and a separate queue for frames and sound (Phase 5) |
 
 ## Building (Windows)
 
@@ -156,9 +157,38 @@ like Phase 2's speed test.
 - **Pad** (`0x03`) is the port's pad word as the N64 reads it: buttons in bits 0-13 in the N64's order, then the
   stick's x and y as signed bytes, +y up, clamped to 85 either way.
 - **Pong** is pcsx2-rombie's: `{"t":"pong","c":<page time>,"e":<engine time>}`.
-- **Events**: booted (with the ROM's name, sent again to a page that comes back), paused, resumed, speed, stopped and
-  error. After "stopped" the engine closes the connection normally (1000, "stopped") and exits.
-- **Not yet**: save states and the game data blob (Phase 5), lockstep (Phase 6).
+- **Events**: booted (with the ROM's name, sent again to a page that comes back), paused, resumed, speed,
+  state-loaded, state-version, stopped and error. After "stopped" the engine closes the connection normally (1000,
+  "stopped") and exits.
+- **Queues**: frames and sound go in a small queue that drops them when the page falls behind; everything else
+  (events, states, game data, disc reads) in an unbounded one the writer serves first, so nothing of it is lost.
+- **Not yet**: lockstep (Phase 6).
+
+### Game data and save states (plan Phase 5)
+
+The message numbers are pcsx2-rombie's: `0x08` game data before boot and `0x85` from the engine, `0x06` save state
+answered with `0x84`, `0x07` load state answered with the event "state-loaded" (pcsx2-rombie's), "error" or
+"state-version".
+
+- **Game data** is the game's one stored object, which the page keeps gzipped as its in-game save: `RN64`, u32
+  version 1, the u32 lengths of the EEPROM, SRAM, FlashRAM and the four Controller Paks (each 0 or its full size: 2 KB,
+  32 KB, 128 KB, 4 x 32 KB), then those bytes. The cart's save goes in as gopher64's save type for the game has it
+  (`get_save_type`, which gives unlisted games both EEPROM and SRAM), and the Controller Paks always: 162 KB for Super
+  Mario 64 or Ocarina of Time. The page sends it before boot, `ui::storage::load_saves` puts it in place of the save
+  files, and gopher64's formatting fills only what's missing. The engine sends it back where gopher64 would write its
+  files: a second after the game's last write (`EVENT_TYPE_SAVE`), before a pause, after a state loads, and when the
+  game stops, ahead of "stopped". A blob that doesn't parse gets an "error", and so does the boot after it: booting
+  with fresh saves would send those back as the game's. No blob is a new game.
+- **Save states** are gopher64's own (its zip of the device, the saves with the Controller Paks, and parallel-rdp's
+  state), behind a header: `RN64STAT`, u32 version 1, then the engine version and gopher64's build as u8-length
+  strings. They're served at a VI, and while paused, rather than where gopher64's hotkeys run them (a VI origin write),
+  so a paused game can save and load. A loaded state replaces the saves too, so the page gets the game data after it.
+- **Only the engine version that made a state loads it.** gopher64's state isn't self-describing (postcard), and a
+  build with one more `u32` in `Vi` loaded a state from this one with no error. Ocarina of Time even played on, but
+  the fields after it were read from the wrong bytes. So a state from another engine version gets "state-version", with
+  the version that made it, and isn't loaded, as the Xbox engine refuses one. Rombie shows "Made on" for such a slot.
+- **Sizes and times** on the main PC, measured at the page: Super Mario 64's state 1.07 MB and Ocarina of Time's 1.72
+  MB, saved in 52 to 87 ms and loaded in 30 to 54 ms, the engine's own part 25 to 49 ms.
 
 ### What the engine is, whatever the config says
 
@@ -183,8 +213,8 @@ like Phase 2's speed test.
 - **Controls.** Pause holds the game at its next VI, until resume, exit or the page's grace runs out. Fast-forward
   divides the VI pace by the page's ratio (at most 10). While fast, the engine sends about one frame per display
   refresh, and gopher64's own audio queue drops what the 48 kHz pull can't take.
-- **Saves.** `ui::storage::write_saves` writes nothing in engine mode, so no game's save reaches the engine's folder.
-  They stay in memory until Phase 5 sends them to the page.
+- **Saves.** `ui::storage::load_saves` and `write_saves` read and write no files in engine mode, so no game's save
+  reaches the engine's folder: they come from the page and go back to it as the game data (below).
 - **Settings** gopher64 reads from its config are set for the run: no Transfer Pak, VRU, USB, rewind or overclock,
   not fullscreen, and the picture as above.
 

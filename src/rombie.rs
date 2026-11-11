@@ -17,7 +17,8 @@
 //!   0x04 control    [u8 type][u8 op]                                         (1 pause, 2 resume, 3 exit)
 //!   0x05 ping       [u8 type][7 pad][f64 page time, ms]
 //!   0x06 save state [u8 type]                                                (answered with 0x84)
-//!   0x07 load state [u8 type][7 pad][state bytes]                            (answered with state-loaded or error)
+//!   0x07 load state [u8 type][7 pad][state bytes]                            (answered with state-loaded, error, or
+//!                                                                             state-version: made on another version)
 //!   0x08 game data  [u8 type][7 pad][blob]                                   (before boot; empty = a new game)
 //!   0x09 speed      [u8 type][3 pad][f32 ratio]                              (1 = normal; more = fast-forward, to 10)
 //! Engine to page (binary):
@@ -28,7 +29,7 @@
 //!   0x85 game data  [u8 type][7 pad][blob]   (a second after the game last wrote its saves, before a pause, after a
 //!                                            state loads, and on exit ahead of "stopped")
 //! Engine to page (text, JSON): hello {"t":"hello","engine","version","protocol","gopher64"}, event
-//! {"t":"event","what","detail"} (booted, paused, resumed, speed, state-loaded, stopped, error), stats (once a second),
+//! {"t":"event","what","detail"} (booted, paused, resumed, speed, state-loaded, state-version, stopped, error), stats (once a second),
 //! and pong {"t":"pong","c":<page time>,"e":<engine time>}.
 //!
 //! The game data blob is the game's one stored object: "RN64", u32 version 1, then u32 lengths of the EEPROM, SRAM,
@@ -992,6 +993,12 @@ fn serve_states(device: &mut device::Device) {
     let load = STATE_TO_LOAD.lock().unwrap().take();
     if let Some(bytes) = load {
         match parse_state(&bytes) {
+            // gopher64's state isn't self-describing: one from a build whose device layout differs can load with
+            // wrong values and no error. So only the engine version that made a state loads it, as on the Xbox.
+            Some((version, _)) if version != VERSION => {
+                state_ms();
+                send_event("state-version", &version);
+            }
             Some((version, state)) => {
                 *LOADING_STATE_VERSION.lock().unwrap() = version;
                 *LOADING_STATE.lock().unwrap() = Some(state);
