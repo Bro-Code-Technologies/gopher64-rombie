@@ -13,6 +13,8 @@ const NTSC_STANDARD_WIDTH: i32 = 320;
 const NTSC_HEIGHT: i32 = 240;
 
 fn build_gfx_info(device: &mut device::Device, netplay: bool) -> GFX_INFO {
+    // Rombie's engine mode sends the N64's own picture: 1x, no supersampling, no widescreen or CRT.
+    let rombie = crate::rombie::active();
     GFX_INFO {
         RDRAM: device.rdram.mem.as_mut_ptr(),
         DMEM: device.rsp.mem.as_mut_ptr(),
@@ -23,20 +25,41 @@ fn build_gfx_info(device: &mut device::Device, netplay: bool) -> GFX_INFO {
         DPC_STATUS_REG: &mut device.rdp.regs_dpc[device::rdp::DPC_STATUS_REG],
         PAL: device.cart.pal,
         fullscreen: device.ui.video.fullscreen,
-        widescreen: device.ui.video.widescreen,
+        widescreen: device.ui.video.widescreen && !rombie,
         vsync: if !netplay {
             device.ui.config.video.vsync
         } else {
             false
         },
         integer_scaling: device.ui.config.video.integer_scaling,
-        upscale: device.ui.config.video.upscale,
-        ssaa: device.ui.config.video.ssaa,
-        crt: device.ui.config.video.crt,
+        upscale: if rombie {
+            1
+        } else {
+            device.ui.config.video.upscale
+        },
+        ssaa: device.ui.config.video.ssaa && !rombie,
+        crt: device.ui.config.video.crt && !rombie,
     }
 }
 
 pub fn init(device: &mut device::Device, netplay: bool) {
+    if crate::rombie::active() {
+        let gfx_info = build_gfx_info(device, netplay);
+        if !unsafe {
+            rdp_init(
+                std::ptr::null_mut(),
+                gfx_info,
+                std::ptr::null(),
+                0,
+                device.ui.storage.save_state_slot,
+            )
+        } {
+            panic!("Failed to init parallel-rdp.");
+        }
+        fps_counter(&mut device.ui);
+        return;
+    }
+
     ui::sdl_init(sdl3_sys::init::SDL_INIT_VIDEO);
     ui::ttf_init();
 
@@ -184,6 +207,18 @@ pub fn render_frame() {
     unsafe { rdp_render_frame() }
 }
 
+/// Rombie's engine mode: reads the frame back as RGBA into `out`, after its first `header` bytes.
+pub fn read_frame(out: &mut Vec<u8>, header: usize) -> Option<(u32, u32)> {
+    let frame = unsafe { rdp_read_frame() };
+    if frame.pixels.is_null() {
+        return None;
+    }
+    let len = frame.width as usize * frame.height as usize * 4;
+    out.resize(header + len, 0);
+    out[header..].copy_from_slice(unsafe { std::slice::from_raw_parts(frame.pixels, len) });
+    Some((frame.width, frame.height))
+}
+
 pub fn state_size() -> usize {
     unsafe { rdp_state_size() }
 }
@@ -223,7 +258,8 @@ pub fn pause_loop(ui: &mut ui::Ui, frame_time: f64) {
 pub fn check_callback(device: &mut device::Device) -> (bool, bool) {
     let mut speed_limiter_toggled = false;
     let callback = unsafe { rdp_check_callback() };
-    device.cpu.running = callback.emu_running;
+    device.cpu.running =
+        callback.emu_running && (!crate::rombie::active() || crate::rombie::connected());
     if device.netplay.is_none() {
         if callback.save_state {
             device.savestate.save_state = true;

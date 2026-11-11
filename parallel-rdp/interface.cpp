@@ -137,6 +137,37 @@ static Vulkan::ImageHandle fps_image;
 
 static std::queue<JoystickEvent> joystick_events;
 
+// Rombie's engine mode: no window and no WSI. With no surface to match,
+// Granite picks the discrete GPU (GRANITE_VULKAN_DEVICE_INDEX picks another).
+static Vulkan::ContextHandle headless_context;
+static Vulkan::DeviceHandle headless_device;
+static std::vector<RDP::RGBA> headless_frame;
+
+static Vulkan::Device &get_device() {
+  return headless_device ? *headless_device : wsi->get_device();
+}
+
+static bool init_headless() {
+  if (!Context::init_loader(nullptr)) {
+    LOGE("Failed to init vulkan loader.\n");
+    return false;
+  }
+  headless_context = Util::make_handle<Context>();
+  headless_context->set_num_thread_indices(1);
+  headless_context->set_system_handles({});
+  if (!headless_context->init_instance_and_device(
+          nullptr, 0, nullptr, 0,
+          CONTEXT_CREATION_ENABLE_PUSH_DESCRIPTOR_BIT |
+              CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT |
+              CONTEXT_CREATION_ENABLE_DESCRIPTOR_HEAP_BIT)) {
+    LOGE("Failed to create a Vulkan device.\n");
+    return false;
+  }
+  headless_device = Util::make_handle<Device>();
+  headless_device->set_context(*headless_context);
+  return true;
+}
+
 typedef struct {
   float SourceSize[4];
   float OutputSize[4];
@@ -356,7 +387,7 @@ static void rdp_new_processor() {
     gfx_info.upscale = 1;
   }
 
-  processor = new RDP::CommandProcessor(wsi->get_device(), gfx_info.RDRAM, 0,
+  processor = new RDP::CommandProcessor(get_device(), gfx_info.RDRAM, 0,
                                         gfx_info.RDRAM_SIZE,
                                         gfx_info.RDRAM_SIZE / 2, flags);
   g_tmem = processor->get_tmem();
@@ -397,6 +428,25 @@ bool rdp_init(void *_window, GFX_INFO _gfx_info, const void *font,
               size_t font_size, uint32_t save_state_slot) {
   memset(&rdp_device, 0, sizeof(RDP_DEVICE));
   memset(&callback, 0, sizeof(CALL_BACK));
+
+  if (!_window) {
+    window = nullptr;
+    gfx_info = _gfx_info;
+    if (!init_headless()) {
+      rdp_close();
+      return false;
+    }
+    rdp_new_processor();
+    if (!processor->device_is_supported()) {
+      LOGE("Failed to init parallel-rdp processor.\n");
+      rdp_close();
+      return false;
+    }
+    callback.emu_running = true;
+    callback.enable_speedlimiter = true;
+    callback.save_state_slot = save_state_slot;
+    return true;
+  }
 
   window = (SDL_Window *)_window;
   SDL_SyncWindow(window);
@@ -515,6 +565,13 @@ void rdp_close() {
     wsi_platform = nullptr;
   }
 
+  if (headless_device || headless_context) {
+    headless_frame = {};
+    headless_device.reset();
+    headless_context.reset();
+    return;
+  }
+
   SDL_RemoveEventWatch(sdl_event_filter, nullptr);
 }
 
@@ -593,7 +650,7 @@ static uint32_t pop_message_callback(void *userdata, SDL_TimerID timerID,
   return 0;
 }
 
-static void render_frame(Vulkan::Device &device) {
+static RDP::ScanoutOptions scanout_options() {
   RDP::ScanoutOptions options = {};
   options.persist_frame_on_invalid_input = true;
   options.blend_previous_frame = !gfx_info.ssaa;
@@ -625,8 +682,11 @@ static void render_frame(Vulkan::Device &device) {
       options.crop_rect.bottom = 30;
     }
   }
+  return options;
+}
 
-  Vulkan::ImageHandle image = processor->scanout(options);
+static void render_frame(Vulkan::Device &device) {
+  Vulkan::ImageHandle image = processor->scanout(scanout_options());
 
   Vulkan::ResourceLayout vertex_layout = {};
   Vulkan::ResourceLayout fragment_layout = {};
@@ -720,7 +780,21 @@ void rdp_render_frame() {
   render_frame(device);
 }
 
+RDP_FRAME rdp_read_frame() {
+  unsigned width = 0, height = 0;
+  processor->scanout_sync(headless_frame, width, height, scanout_options());
+  return RDP_FRAME{
+      headless_frame.empty()
+          ? nullptr
+          : reinterpret_cast<const uint8_t *>(headless_frame.data()),
+      width, height};
+}
+
 void rdp_update_screen() {
+  if (headless_device) {
+    headless_device->next_frame_context();
+    return;
+  }
   if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) {
     return;
   }
@@ -816,6 +890,8 @@ static void push_onscreen_message(void *data) {
 }
 
 void rdp_onscreen_message(const char *message, MESSAGE_LENGTH milliseconds) {
+  if (headless_device)
+    return;
   Message *data = new Message;
   data->message = message;
   data->milliseconds = static_cast<uint64_t>(milliseconds);

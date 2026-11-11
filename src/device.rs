@@ -68,9 +68,17 @@ pub fn run_game(
     // rdram pointer is shared with parallel-rdp and retroachievements
     rdram::init(device);
 
+    // Rombie's engine mode: the page plays all four ports, and no pad or key of gopher64's own reaches the game.
+    if crate::rombie::active() {
+        device.ui.config.input.controller_enabled = [true; 4];
+        crate::rombie::wait_for_page();
+    }
+
     ui::video::init(device, netplay_config.is_some());
     ui::audio::init(device);
-    ui::input::init(&mut device.ui);
+    if !crate::rombie::active() {
+        ui::input::init(&mut device.ui);
+    }
 
     // must be after video init
     if let Some(netplay_config) = &netplay_config {

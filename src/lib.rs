@@ -6,6 +6,7 @@ mod device;
 mod netplay;
 #[cfg_attr(not(feature = "upstream-extras"), path = "retroachievements_off.rs")]
 mod retroachievements;
+mod rombie;
 mod savestates;
 mod ui;
 use clap::Parser;

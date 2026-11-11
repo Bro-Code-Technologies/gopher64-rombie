@@ -57,13 +57,23 @@ pub fn init_game_audio(device: &mut device::Device) {
         channels: 2,
     };
 
+    // Rombie's engine mode: no sound device. The stream converts to the page's 48 kHz, and rombie pulls it.
+    let page_audio_spec = sdl3_sys::audio::SDL_AudioSpec {
+        format: sdl3_sys::audio::SDL_AUDIO_F32LE,
+        freq: 48000,
+        channels: 2,
+    };
     device.ui.audio.audio_stream = unsafe {
-        sdl3_sys::audio::SDL_OpenAudioDeviceStream(
-            sdl3_sys::audio::SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
-            &game_audio_spec,
-            None,
-            std::ptr::null_mut(),
-        )
+        if crate::rombie::active() {
+            sdl3_sys::audio::SDL_CreateAudioStream(&game_audio_spec, &page_audio_spec)
+        } else {
+            sdl3_sys::audio::SDL_OpenAudioDeviceStream(
+                sdl3_sys::audio::SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,
+                &game_audio_spec,
+                None,
+                std::ptr::null_mut(),
+            )
+        }
     };
     if device.ui.audio.audio_stream.is_null() {
         panic!("Could not create audio stream");
@@ -78,6 +88,9 @@ pub fn init_game_audio(device: &mut device::Device) {
     } {
         panic!("Could not initialize audio stream");
     }
+    if crate::rombie::active() {
+        crate::rombie::start_audio(device.ui.audio.audio_stream);
+    }
     if device.ai.regs[device::ai::AI_STATUS_REG] & device::ai::AI_STATUS_BUSY != 0 {
         resume_game_audio(&mut device.ui);
     } else {
@@ -90,18 +103,29 @@ pub fn close(ui: &mut ui::Ui) {
 }
 
 pub fn resume_game_audio(ui: &mut ui::Ui) {
+    if crate::rombie::active() {
+        crate::rombie::set_audio_paused(false);
+        return;
+    }
     unsafe {
         sdl3_sys::audio::SDL_ResumeAudioStreamDevice(ui.audio.audio_stream);
     }
 }
 
 pub fn pause_game_audio(ui: &mut ui::Ui) {
+    if crate::rombie::active() {
+        crate::rombie::set_audio_paused(true);
+        return;
+    }
     unsafe {
         sdl3_sys::audio::SDL_PauseAudioStreamDevice(ui.audio.audio_stream);
     }
 }
 
 pub fn close_game_audio(ui: &mut ui::Ui) {
+    if crate::rombie::active() {
+        crate::rombie::stop_audio();
+    }
     unsafe {
         if !ui.audio.audio_stream.is_null() {
             sdl3_sys::audio::SDL_DestroyAudioStream(ui.audio.audio_stream);

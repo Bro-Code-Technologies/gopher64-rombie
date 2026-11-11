@@ -117,7 +117,11 @@ pub fn write_regs(device: &mut device::Device, address: u64, value: u32, mask: u
 
 pub fn update_screen(device: &mut device::Device) {
     if !netplay::in_rollback(device.netplay.as_ref()) {
-        ui::video::render_frame();
+        if crate::rombie::active() {
+            crate::rombie::send_frame(device.vi.frame_time);
+        } else {
+            ui::video::render_frame();
+        }
     }
 
     let (speed_limiter_toggled, paused) = ui::video::check_callback(device);

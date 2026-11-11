@@ -58,7 +58,8 @@ default build is unchanged. The engine build (`--no-default-features`) has none 
 
 gopher64's `tokio` dependency now names the features its own code uses (`sync`, `macros`, `time`, `net`, `io-util`).
 The left-out crates used to turn them on for it. SDL_ttf with FreeType and Roboto Mono stay for now, since gopher64's
-window draws its on-screen text with them. Phase 3's windowless engine decides whether they go.
+window draws its on-screen text with them. Phase 3's windowless engine draws no text, so they can go once the engine
+build has no window.
 
 The engine build compiles 139 crates (the table below), down from Phase 1's 382, and none of the left-out ones. Its exe
 holds no cheat text and no URL but error-message links (clap, libbzip2, PIX).
@@ -83,6 +84,31 @@ instruction (`addiu` by `ori`), Ocarina of Time stays on a black screen. The use
 With `GOPHER64_ROMBIE_SPEED_LOG` naming a file, the engine writes a line to it for each finished frame
 (`f <microseconds> <frame time in ns>`) and each audio underrun (`u <microseconds> <bytes>`: SDL asked for more sound
 than was queued, and got silence). Unset, it does nothing. Phase 2's speed table is worked out from it.
+
+## Windowless spike (plan Phase 3)
+
+With `GOPHER64_ROMBIE_SPIKE_PORT` set, `gopher64.exe <rom> [--load-state <slot>]` runs in engine mode, the core of
+what Phase 4 makes the engine. Unset, nothing changes. `src/rombie.rs` holds it, and its header lists the messages:
+
+- **No window.** `rdp_init` in `parallel-rdp/interface.cpp` takes a null window to mean engine mode: it creates
+  Granite's Vulkan context and device with no surface and no WSI. With no surface to match, Granite takes the discrete
+  GPU over an integrated one, so a two-GPU laptop runs on its GeForce. `GRANITE_VULKAN_DEVICE_INDEX=<n>` (Granite's
+  own) picks the nth GPU in the order the log lists them, for the Intel UHD run of Phase 6. SDL's video and TTF aren't
+  started, and on-screen messages are dropped.
+- **Frames.** At each VI, where the windowed build draws, `rdp_read_frame` reads parallel-rdp's scanout back at the
+  VI's own size (`scanout_sync`, the same scanout options as the window) and `rombie::send_frame` sends it as RGBA,
+  alpha forced opaque. The engine time in the message is taken before the readback, so the page's delay includes it.
+  `rdp_update_screen` moves Granite to its next frame context, as the swapchain's frame did. 1x, with no supersampling,
+  widescreen or CRT, whatever the config says.
+- **Sound.** The game's audio stream converts to 48 kHz stereo float with no device behind it. A thread pulls it at
+  48 kHz by the clock, as a sound card would, and sends blocks of 256 to 2048 frames, as pcsx2-rombie's audio does.
+  gopher64's own pacing stays: the stream's get callback pads a shortfall with silence and nudges the rate. While the
+  game's AI is idle (where gopher64 pauses its sound device), the thread keeps the clock and sends silence, as a paused
+  device plays it. Stopping instead drained the page's buffer by each pause: GoldenEye's emptied in 33 seconds.
+- **Pads.** The page sends each port's pad word as the N64 reads it. All four ports are on, and gopher64's own keyboard
+  and pad input isn't opened, so nothing else reaches the game.
+- **The page.** One page, on `127.0.0.1` only, with no key or origin check yet (Phase 4). The game starts once it
+  connects and ends when it leaves. Rombie's `engine/n64/engine-test.html` is that page.
 
 ## License scan (plan Phase 1)
 

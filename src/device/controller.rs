@@ -58,6 +58,11 @@ pub fn process(device: &mut device::Device, channel: usize) {
             let offset = device.pif.channels[channel].rx_buf.unwrap();
             let input = if let Some(netplay) = &mut device.netplay {
                 netplay.inputs[channel].0
+            } else if crate::rombie::active() {
+                ui::input::InputData {
+                    data: crate::rombie::pad(channel),
+                    pak_change_pressed: false,
+                }
             } else {
                 ui::input::get(&mut device.ui, channel)
             };
