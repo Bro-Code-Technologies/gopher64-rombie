@@ -397,6 +397,10 @@ fn writeback_sdcard(device: &mut device::Device) {
 }
 
 pub fn write_saves(device: &mut device::Device) {
+    // Rombie's engine mode writes no game's saves to its folder; they stay in memory (Phase 5 sends them to the page).
+    if crate::rombie::active() {
+        return;
+    }
     if device.netplay.is_none() || device.netplay.as_ref().unwrap().player_number == 0 {
         if device.ui.storage.saves.write_to_disk {
             if device.ui.storage.saves.eeprom.write_pending {

@@ -4,6 +4,14 @@ fn main() {
     println!("cargo::rerun-if-changed=src/compat");
     println!("cargo::rerun-if-changed=data/translations");
     println!("cargo::rerun-if-changed=data/ui");
+    println!("cargo::rerun-if-changed=rombie/VERSION");
+
+    // The Rombie N64 engine's version (rombie/RELEASING.md), apart from gopher64's.
+    let rombie_version = std::fs::read_to_string("rombie/VERSION")
+        .unwrap()
+        .trim()
+        .to_string();
+    println!("cargo:rustc-env=ROMBIE_N64_ENGINE_VERSION={rombie_version}");
 
     #[cfg(feature = "gui")]
     {
@@ -137,10 +145,18 @@ fn main() {
         volk_build.flag("-DVK_USE_PLATFORM_WIN32_KHR");
         rdp_build.flag("-DVK_USE_PLATFORM_WIN32_KHR");
 
-        winresource::WindowsResource::new()
-            .set_icon("data/icon/icon.ico")
-            .compile()
-            .unwrap();
+        let mut resource = winresource::WindowsResource::new();
+        resource.set_icon("data/icon/icon.ico");
+        // The engine build is the Rombie N64 Engine: browsers name it so in their prompt to open its link.
+        if !cfg!(feature = "gui") {
+            resource
+                .set("FileDescription", "Rombie N64 Engine")
+                .set("ProductName", "Rombie N64 Engine")
+                .set("OriginalFilename", "rombie-n64-engine.exe")
+                .set("FileVersion", &rombie_version)
+                .set("ProductVersion", &rombie_version);
+        }
+        resource.compile().unwrap();
     } else if os == "macos" {
         let output = std::process::Command::new("clang")
             .args(["--print-runtime-dir"])

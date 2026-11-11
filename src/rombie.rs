@@ -1,26 +1,73 @@
-//! Rombie's engine mode, at this point the spike of plan Phase 3 (docs/rombie/notes.md). With
-//! GOPHER64_ROMBIE_SPIKE_PORT set, the game opens no window and no sound device: it waits for one page on that
-//! 127.0.0.1 port, sends it the frames and the sound, and plays the pads it sends. It ends when the page leaves.
+//! Rombie's engine mode (docs/rombie/notes.md): gopher64 driven by one Rombie page over a localhost WebSocket, with no
+//! window and no sound device. The engine build's launch modes, as pcsx2-rombie's and xemu-rombie's:
+//!   (no arguments)                            register rombie-n64:// for this Windows user (HKCU), then exit
+//!   --link <url>                              started by the link: serve the page with the URL's key, exit when gone
+//!   --unregister                              remove the registration
+//!   --key <key> [--port <p>] [--origin <o>]   development: serve pages presenting <key>; --origin also admits <o>
+//!   --version                                 print the version
+//! Any other command line is gopher64's own.
 //!
-//! Every multi-byte value is little-endian, and the frame, audio and ping messages are pcsx2-rombie's (Session.h).
+//! Every multi-byte value is little-endian. The layouts are pcsx2-rombie's (Session.h) but for boot and pad.
 //! Page to engine (binary, first byte is the type):
-//!   0x03 pad    [u8 type][u8 port][2 pad][u32 pad word]   (port 0-3. The word as the N64 reads it: buttons in bits
-//!                                                        0-13 in the N64's order, then the stick's x and y as signed
-//!                                                        bytes, +y up, at most 85 either way)
-//!   0x05 ping   [u8 type][7 pad][f64 page time, ms]
+//!   0x01 boot       [u8 type][3 pad][u32 0][u64 ROM size][ROM name, UTF-8]   (the N64 has no BIOS to send)
+//!   0x02 disc data  [u8 type][3 pad][u32 request id][bytes]                  (empty = the read failed)
+//!   0x03 pad        [u8 type][u8 port][2 pad][u32 pad word]                  (port 0-3. The word as the N64 reads it:
+//!                   buttons in bits 0-13 in the N64's order, d-pad right, left, down, up, Start, Z, B, A, C right,
+//!                   left, down, up, R, L; then the stick's x and y as signed bytes, +y up, at most 85 either way)
+//!   0x04 control    [u8 type][u8 op]                                         (1 pause, 2 resume, 3 exit)
+//!   0x05 ping       [u8 type][7 pad][f64 page time, ms]
+//!   0x09 speed      [u8 type][3 pad][f32 ratio]                              (1 = normal; more = fast-forward, to 10)
 //! Engine to page (binary):
-//!   0x82 frame  [u8 type][3 pad][u32 frame no][f64 engine time, ms][u16 w][u16 h][u32 vi no][RGBA]
-//!   0x83 audio  [u8 type][3 pad][u32 frames][f32 stereo, interleaved, 48 kHz]
-//! Engine to page (text, JSON): hello, stats (once a second), pong.
-use crate::ui;
+//!   0x81 disc read  [u8 type][3 pad][u32 request id][u64 offset][u32 length]  (the ROM, read whole before the boot)
+//!   0x82 frame      [u8 type][3 pad][u32 frame no][f64 engine time, ms][u16 w][u16 h][u32 vi no][RGBA]
+//!   0x83 audio      [u8 type][3 pad][u32 frames][f32 stereo, interleaved, 48 kHz]
+//! Engine to page (text, JSON): hello {"t":"hello","engine","version","protocol","gopher64"}, event
+//! {"t":"event","what","detail"} (booted, paused, resumed, speed, stopped, error), stats (once a second), and pong
+//! {"t":"pong","c":<page time>,"e":<engine time>}.
+//!
+//! One game per process: it boots when the page's boot message comes, and the process ends when the game stops.
+use crate::{device, ui};
 use futures::{SinkExt, StreamExt};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 
+pub const VERSION: &str = env!("ROMBIE_N64_ENGINE_VERSION");
+const PROTOCOL: u32 = 1;
+const ENGINE_PORT: u16 = 47654;
+const LINK_SCHEME: &str = "rombie-n64";
+const ALLOWED_ORIGINS: [&str; 4] = [
+    "https://rombie.app",
+    "https://staged.rombie.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+];
+/// How long a link-started engine waits for its page, and how long a running game outlives its page so a reload can
+/// come back to it.
+const STARTUP_WAIT_S: f64 = 60.0;
+const RECONNECT_GRACE_S: f64 = 10.0;
+/// A page that stops reading this long is frozen or gone, even with its connection open.
+const STALLED_SEND_S: u64 = 10;
+const DISC_CHUNK: u64 = 1 << 20;
+const DISC_WAIT_S: u64 = 30;
+const MIN_ROM_SIZE: u64 = 0x1000;
+const MAX_ROM_SIZE: u64 = 64 << 20;
+const MAX_SPEED: f32 = 10.0;
+/// While fast-forwarding, about one frame per display refresh: the page only shows the newest.
+const FAST_FRAME_INTERVAL_MS: f64 = 1000.0 / 60.0 - 2.0;
+
+const MSG_BOOT: u8 = 0x01;
+const MSG_DISC_DATA: u8 = 0x02;
 const MSG_PAD: u8 = 0x03;
+const MSG_CONTROL: u8 = 0x04;
 const MSG_PING: u8 = 0x05;
+const MSG_SPEED: u8 = 0x09;
+const MSG_DISC_READ: u8 = 0x81;
 const MSG_FRAME: u8 = 0x82;
 const MSG_AUDIO: u8 = 0x83;
+const CONTROL_PAUSE: u8 = 1;
+const CONTROL_RESUME: u8 = 2;
+const CONTROL_EXIT: u8 = 3;
 const FRAME_HEADER_SIZE: usize = 24;
 const AUDIO_HEADER_SIZE: usize = 8;
 const AUDIO_RATE: f64 = 48000.0;
@@ -32,20 +79,39 @@ const PAD_BUTTONS: u32 = 0x3FFF;
 /// the newer frames rather than a growing delay.
 const SEND_QUEUE: usize = 16;
 
-static PORT: std::sync::LazyLock<Option<u16>> = std::sync::LazyLock::new(|| {
-    std::env::var("GOPHER64_ROMBIE_SPIKE_PORT")
-        .ok()?
-        .parse()
-        .ok()
-});
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Link,
+    Dev,
+}
+
+struct Engine {
+    dev_origin: Option<String>,
+    dir: std::path::PathBuf,
+}
+
+static ENGINE: std::sync::OnceLock<Engine> = std::sync::OnceLock::new();
 static START: std::sync::LazyLock<std::time::Instant> =
     std::sync::LazyLock::new(std::time::Instant::now);
+static KEY: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+/// When the engine last lost its page (or started), and how long it may stay without one.
+static IDLE: std::sync::Mutex<Option<(std::time::Instant, f64)>> = std::sync::Mutex::new(None);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
+static BOOTED: AtomicBool = AtomicBool::new(false);
 static OUT: std::sync::Mutex<Option<tokio::sync::mpsc::Sender<Message>>> =
     std::sync::Mutex::new(None);
+static BOOT: std::sync::Mutex<Option<(u64, String)>> = std::sync::Mutex::new(None);
+static GAME_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static DISC_REPLY: std::sync::Mutex<Option<(u32, std::sync::mpsc::Sender<Vec<u8>>)>> =
+    std::sync::Mutex::new(None);
 static PADS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static SPEED_BITS: AtomicU32 = AtomicU32::new(0x3F80_0000); // 1.0
+static PAUSE_WANTED: AtomicBool = AtomicBool::new(false);
+static EXIT_WANTED: AtomicBool = AtomicBool::new(false);
+static EMU_PAUSED: AtomicBool = AtomicBool::new(false);
 static FRAME_NO: AtomicU32 = AtomicU32::new(0);
 static VI_NO: AtomicU32 = AtomicU32::new(0);
+static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
 static AUDIO_PAUSED: AtomicBool = AtomicBool::new(true);
 static AUDIO_STOP: AtomicBool = AtomicBool::new(false);
 static AUDIO_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
@@ -85,11 +151,21 @@ static STATS: Stats = Stats {
 };
 
 pub fn active() -> bool {
-    PORT.is_some()
+    ENGINE.get().is_some()
 }
 
-pub fn connected() -> bool {
+fn connected() -> bool {
     CONNECTED.load(Relaxed)
+}
+
+/// The engine's own folders, so it never shares settings or saves with a gopher64 the player installed themselves.
+pub fn dirs() -> Option<ui::Dirs> {
+    let dir = &ENGINE.get()?.dir;
+    Some(ui::Dirs {
+        config_dir: dir.join("config"),
+        data_dir: dir.join("data"),
+        cache_dir: dir.join("cache"),
+    })
 }
 
 fn now_ms() -> f64 {
@@ -109,95 +185,618 @@ fn send(message: Message) -> bool {
     }
 }
 
-/// Before the game starts: listens on the port and returns once a page has connected.
-pub fn wait_for_page() {
-    let port = PORT.expect("engine mode is off");
-    let _ = *START;
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    tokio::spawn(serve(port, ready_tx));
-    match ready_rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => panic!("Could not listen on 127.0.0.1:{port}: {err}"),
-        Err(_) => panic!("The page server stopped"),
+fn send_event(what: &str, detail: &str) {
+    let detail: String = detail
+        .chars()
+        .flat_map(|c| match c {
+            '"' | '\\' => vec!['\\', c],
+            c if (c as u32) < 0x20 => vec![' '],
+            c => vec![c],
+        })
+        .collect();
+    send(Message::Text(
+        format!(r#"{{"t":"event","what":"{what}","detail":"{detail}"}}"#).into(),
+    ));
+}
+
+fn mark_idle(limit_s: f64) {
+    *IDLE.lock().unwrap() = Some((std::time::Instant::now(), limit_s));
+}
+
+fn idle_overrun() -> bool {
+    match *IDLE.lock().unwrap() {
+        Some((since, limit_s)) => since.elapsed().as_secs_f64() > limit_s,
+        None => false,
     }
 }
 
-async fn serve(port: u16, ready: std::sync::mpsc::Sender<Result<(), String>>) {
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+fn speed() -> f32 {
+    f32::from_bits(SPEED_BITS.load(Relaxed))
+}
+
+/// The VI pace's divisor: more than 1 while fast-forwarding.
+pub fn speed_ratio() -> f64 {
+    speed() as f64
+}
+
+/// Whether the game should go on: not once the page asked it to stop, or its page stayed away past the grace.
+pub fn keep_running() -> bool {
+    !EXIT_WANTED.load(Relaxed) && (connected() || !idle_overrun())
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Launch modes
+
+/// The engine build's own launch modes. None leaves the command line to gopher64; Some is the exit code.
+pub fn main() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() <= 1 {
+        return Some(match register() {
+            Ok(()) => {
+                report_info(
+                    "The N64 engine is set up.\n\nYou don't need to start it yourself: Rombie starts it whenever you play \
+                     an N64 game. If you move this folder, run the engine once more from its new place.",
+                );
+                0
+            }
+            Err(err) => {
+                report_error(
+                    &format!("The N64 engine couldn't set itself up: {err}"),
+                    false,
+                );
+                1
+            }
+        });
+    }
+
+    let mut mode = None;
+    let mut key = String::new();
+    let mut port = ENGINE_PORT;
+    let mut dev_origin = None;
+    let mut i = 1;
+    while i < args.len() {
+        let value = args.get(i + 1).cloned();
+        match (args[i].as_str(), value) {
+            ("--version", _) => {
+                println!("{VERSION}");
+                return Some(0);
+            }
+            ("--unregister", _) => {
+                return Some(if unregister() {
+                    report_info("The N64 engine's link is removed. You can delete its folder now.");
+                    0
+                } else {
+                    report_error("The N64 engine's link couldn't be removed.", false);
+                    1
+                });
+            }
+            ("--link", Some(url)) => {
+                mode = Some(Mode::Link);
+                key = query_param(&url, "key");
+                if !valid_key(&key) {
+                    report_error(
+                        "Rombie sent the N64 engine a start link it doesn't understand. Update the N64 engine, or \
+                         start the game again.",
+                        false,
+                    );
+                    return Some(1);
+                }
+                i += 1;
+            }
+            ("--key", Some(value)) => {
+                mode = Some(Mode::Dev);
+                key = value;
+                i += 1;
+            }
+            ("--port", Some(value)) => {
+                let Some(value) = value.parse().ok().filter(|p| *p > 0) else {
+                    report_error("Invalid port.", true);
+                    return Some(1);
+                };
+                port = value;
+                i += 1;
+            }
+            ("--origin", Some(value)) => {
+                dev_origin = Some(value);
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mode = mode?;
+    if mode == Mode::Dev && key.len() < 8 {
+        report_error("A --key of at least 8 characters is required.", true);
+        return Some(1);
+    }
+    // The link always uses the one port Rombie knows, and only Rombie's own origins.
+    if mode == Mode::Link {
+        port = ENGINE_PORT;
+        dev_origin = None;
+    }
+
+    let Some(local) = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from) else {
+        report_error(
+            "Can't find this user's local app data folder.",
+            mode == Mode::Dev,
+        );
+        return Some(1);
+    };
+    let dir = if mode == Mode::Dev && port != ENGINE_PORT {
+        local.join(format!("RombieN64-{port}"))
+    } else {
+        local.join("RombieN64")
+    };
+    for sub in ["config", "data", "cache"] {
+        if std::fs::create_dir_all(dir.join(sub)).is_err() {
+            report_error(
+                &format!("Can't create {}.", dir.display()),
+                mode == Mode::Dev,
+            );
+            return Some(1);
+        }
+    }
+    *KEY.lock().unwrap() = key;
+    let _ = ENGINE.set(Engine { dev_origin, dir });
+    let _ = *START;
+    Some(run(mode, port))
+}
+
+fn valid_key(key: &str) -> bool {
+    (16..=128).contains(&key.len())
+        && key
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+fn query_param(url: &str, name: &str) -> String {
+    let Some((_, query)) = url.split_once('?') else {
+        return String::new();
+    };
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn run(mode: Mode, port: u16) -> i32 {
+    let listener = match listen(port) {
         Ok(listener) => listener,
         Err(err) => {
-            let _ = ready.send(Err(err.to_string()));
-            return;
+            // An engine of ours already holds the port: an idle one takes this link's key and serves the page; a busy
+            // one tells the page so. Either way this process is done.
+            if mode == Mode::Link && hand_off_key(port) {
+                return 0;
+            }
+            eprintln!("rombie: can't listen on 127.0.0.1:{port}: {err}");
+            report_error(
+                &format!(
+                    "The N64 engine needs port {port} on this computer, but another program is using it. Close that \
+                     program, then start the game in Rombie again."
+                ),
+                mode == Mode::Dev,
+            );
+            return 2;
         }
     };
-    eprintln!("rombie: waiting for a page on 127.0.0.1:{port}");
-    let ws = loop {
-        let Ok((stream, _)) = listener.accept().await else {
+    if mode == Mode::Link {
+        // One log per run, beside the engine's other files: the first place to look when a player reports a problem.
+        // Only the engine that holds the port writes it, so a start that hands off its key leaves it alone.
+        redirect_stderr(&ENGINE.get().unwrap().dir.join("engine.log"));
+    }
+    eprintln!(
+        "Rombie N64 engine {VERSION} (gopher64 {})",
+        env!("GIT_DESCRIBE")
+    );
+    eprintln!("rombie: listening on 127.0.0.1:{port} (protocol {PROTOCOL})");
+    mark_idle(STARTUP_WAIT_S);
+    tokio::spawn(serve(listener));
+
+    let game = loop {
+        if EXIT_WANTED.load(Relaxed) {
+            break None;
+        }
+        if mode == Mode::Link && !connected() && idle_overrun() {
+            eprintln!("rombie: no page; exiting");
+            return 0;
+        }
+        let boot = BOOT.lock().unwrap().take();
+        let Some((size, name)) = boot else {
+            std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
         };
-        let _ = stream.set_nodelay(true);
-        if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
-            break ws;
+        match read_rom(size) {
+            Ok(rom) => break Some((rom, name)),
+            Err(err) => send_event("error", &err),
         }
     };
-    // One page a run: no other page can connect while the game plays.
-    drop(listener);
 
+    if let Some((rom, name)) = game {
+        eprintln!("rombie: booting '{name}' ({} bytes)", rom.len());
+        *GAME_NAME.lock().unwrap() = name.clone();
+        BOOTED.store(true, Relaxed);
+        send_event("booted", &name);
+        play(&rom);
+        eprintln!("rombie: the game stopped");
+    }
+    send_event("stopped", "");
+    send(Message::Close(Some(
+        tokio_tungstenite::tungstenite::protocol::CloseFrame {
+            code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal,
+            reason: "stopped".into(),
+        },
+    )));
+    // Let the writer hand the last messages to the page before the process goes.
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(2) {
+        let drained = OUT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|out| out.capacity() == out.max_capacity());
+        if drained {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    0
+}
+
+/// Reads the ROM from the page whole, in chunks, and puts its byte order right.
+fn read_rom(size: u64) -> Result<Vec<u8>, String> {
+    let mut rom = Vec::with_capacity(size as usize);
+    let mut id = 0u32;
+    while (rom.len() as u64) < size {
+        if !connected() {
+            return Err("The page left while the engine read the game.".into());
+        }
+        let offset = rom.len() as u64;
+        let length = DISC_CHUNK.min(size - offset) as u32;
+        id += 1;
+        let (tx, rx) = std::sync::mpsc::channel();
+        *DISC_REPLY.lock().unwrap() = Some((id, tx));
+        let mut request = vec![0u8; 20];
+        request[0] = MSG_DISC_READ;
+        request[4..8].copy_from_slice(&id.to_le_bytes());
+        request[8..16].copy_from_slice(&offset.to_le_bytes());
+        request[16..20].copy_from_slice(&length.to_le_bytes());
+        send(Message::Binary(request.into()));
+        match rx.recv_timeout(std::time::Duration::from_secs(DISC_WAIT_S)) {
+            Ok(bytes) if bytes.len() == length as usize => rom.extend_from_slice(&bytes),
+            _ => return Err("Reading the game from the page failed.".into()),
+        }
+    }
+    DISC_REPLY.lock().unwrap().take();
+    device::swap_rom(rom).ok_or_else(|| "That file isn't an N64 game (.z64, .n64 or .v64).".into())
+}
+
+fn play(rom: &[u8]) {
+    let mut device = device::Device::new(true);
+    // What the engine always is, whatever the config says: all four ports with a Controller Pak each, and the
+    // Expansion Pak. ui::storage writes no saves in engine mode.
+    let config = &mut device.ui.config;
+    config.input.controller_enabled = [true; 4];
+    config.input.transfer_pak = [false; 4];
+    config.input.emulate_vru = false;
+    config.emulation.usb = false;
+    config.emulation.rewind = false;
+    device.ui.video.fullscreen = false;
+    device.ui.video.widescreen = false;
+    device::run_game(
+        &mut device,
+        rom,
+        ui::GameSettings {
+            overclock: false,
+            disable_expansion_pak: false,
+            cheats: Default::default(),
+            load_savestate_slot: None,
+        },
+        crate::retroachievements::RAConfig::default(),
+        None,
+    );
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Connections
+
+fn listen(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        // Nobody else may share the port, not even a socket that asked to.
+        win::exclusive_address(socket.as_raw_socket());
+    }
+    socket.bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))?;
+    socket.listen(4)
+}
+
+/// Another engine holds the port. If it has no page, it takes this link's key over a plain HTTP request a browser
+/// can't forge: the custom header would need a CORS preflight, which the engine never answers.
+fn hand_off_key(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) =
+        std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_secs(3))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    let request = format!(
+        "GET /handoff?key={} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Rombie-Handoff: 1\r\nConnection: close\r\n\r\n",
+        KEY.lock().unwrap()
+    );
+    let mut reply = [0u8; 64];
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let n = stream.read(&mut reply).unwrap_or(0);
+    // 204: an idle engine took the key. 409: it's busy, and the page hears so from it.
+    reply[..n].starts_with(b"HTTP/1.1 204") || reply[..n].starts_with(b"HTTP/1.1 409")
+}
+
+async fn serve(listener: tokio::net::TcpListener) {
+    loop {
+        if let Ok((stream, _)) = listener.accept().await {
+            let _ = stream.set_nodelay(true);
+            tokio::spawn(connection(stream));
+        }
+    }
+}
+
+struct Request {
+    path: String,
+    origin: String,
+    ws_key: String,
+    upgrade: bool,
+    handoff: bool,
+}
+
+async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<Request> {
+    let mut raw = Vec::new();
+    while !raw.ends_with(b"\r\n\r\n") {
+        if raw.len() >= 8192 {
+            return None;
+        }
+        raw.push(stream.read_u8().await.ok()?);
+    }
+    let raw = String::from_utf8_lossy(&raw).into_owned();
+    let mut lines = raw.split("\r\n");
+    let path = lines
+        .next()?
+        .strip_prefix("GET ")?
+        .split(' ')
+        .next()?
+        .to_string();
+    let mut request = Request {
+        path,
+        origin: String::new(),
+        ws_key: String::new(),
+        upgrade: false,
+        handoff: false,
+    };
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().to_string();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "origin" => request.origin = value,
+            "sec-websocket-key" => request.ws_key = value,
+            "upgrade" => request.upgrade = value.eq_ignore_ascii_case("websocket"),
+            "x-rombie-handoff" => request.handoff = true,
+            _ => {}
+        }
+    }
+    Some(request)
+}
+
+#[derive(Clone, Copy)]
+enum Decision {
+    Status(u16),
+    Refuse(u16, &'static str),
+    Accept,
+}
+
+/// Who may connect: only Rombie's own pages, only with the current key, and only one at a time. Refusals a page should
+/// understand complete the handshake and close with a code, since a failed handshake tells page script nothing: 4001
+/// the key isn't this engine's, 4002 another page is playing, 4003 the game is stopping (try again in a moment).
+fn decide(request: &Request) -> Decision {
+    let engine = ENGINE.get().unwrap();
+    if request.handoff {
+        if !request.origin.is_empty() {
+            return Decision::Status(403);
+        }
+        if connected() {
+            return Decision::Status(409);
+        }
+        let key = query_param(&request.path, "key");
+        if !valid_key(&key) {
+            return Decision::Status(400);
+        }
+        *KEY.lock().unwrap() = key;
+        mark_idle(STARTUP_WAIT_S);
+        eprintln!("rombie: took the key from a newer link");
+        return Decision::Status(204);
+    }
+    let allowed = ALLOWED_ORIGINS.contains(&request.origin.as_str())
+        || engine.dev_origin.as_deref() == Some(request.origin.as_str());
+    if !request.upgrade || request.ws_key.is_empty() || !allowed {
+        eprintln!("rombie: refused origin '{}'", request.origin);
+        return Decision::Status(403);
+    }
+    if BOOTED.load(Relaxed) && !keep_running() {
+        return Decision::Refuse(4003, "stopping");
+    }
+    if query_param(&request.path, "key") != *KEY.lock().unwrap() {
+        eprintln!("rombie: refused a stale key from '{}'", request.origin);
+        return Decision::Refuse(4001, "key");
+    }
+    if CONNECTED
+        .compare_exchange(false, true, Relaxed, Relaxed)
+        .is_err()
+    {
+        return Decision::Refuse(4002, "busy");
+    }
+    Decision::Accept
+}
+
+async fn connection(mut stream: tokio::net::TcpStream) {
+    let Ok(Some(request)) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), read_request(&mut stream)).await
+    else {
+        return;
+    };
+    let decision = decide(&request);
+    if let Decision::Status(status) = decision {
+        let _ = stream
+            .write_all(
+                format!("HTTP/1.1 {status} \r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await;
+        return;
+    }
+    let accept =
+        tokio_tungstenite::tungstenite::handshake::derive_accept_key(request.ws_key.as_bytes());
+    let upgrade = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \
+         {accept}\r\n\r\n"
+    );
+    let upgraded = stream.write_all(upgrade.as_bytes()).await.is_ok();
+    if upgraded {
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            stream,
+            tokio_tungstenite::tungstenite::protocol::Role::Server,
+            None,
+        )
+        .await;
+        match decision {
+            Decision::Refuse(code, reason) => {
+                let _ = ws
+                    .close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                        code: code.into(),
+                        reason: reason.into(),
+                    }))
+                    .await;
+                return;
+            }
+            Decision::Accept => {
+                eprintln!("rombie: page connected from '{}'", request.origin);
+                session(ws).await;
+                eprintln!("rombie: page disconnected");
+            }
+            Decision::Status(_) => unreachable!(),
+        }
+    }
+    if matches!(decision, Decision::Accept) {
+        CONNECTED.store(false, Relaxed);
+    }
+}
+
+/// One page, from its first message to its last.
+async fn session(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
     let (mut sink, mut source) = ws.split();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(SEND_QUEUE);
     let _ = out_tx.try_send(Message::Text(
         format!(
-            r#"{{"t":"hello","engine":"gopher64-rombie","version":"{}","spike":true}}"#,
+            r#"{{"t":"hello","engine":"gopher64-rombie","version":"{VERSION}","protocol":{PROTOCOL},"gopher64":"{}"}}"#,
             env!("GIT_DESCRIBE")
         )
         .into(),
     ));
     *OUT.lock().unwrap() = Some(out_tx.clone());
-    CONNECTED.store(true, Relaxed);
-    let _ = ready.send(Ok(()));
+    if BOOTED.load(Relaxed) {
+        send_event("booted", &GAME_NAME.lock().unwrap().clone());
+    }
 
-    let writer = tokio::spawn(async move {
+    let writer = async move {
         while let Some(message) = out_rx.recv().await {
             let frame = matches!(&message, Message::Binary(b) if b.first() == Some(&MSG_FRAME));
             let started = std::time::Instant::now();
-            if sink.send(message).await.is_err() {
-                break;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(STALLED_SEND_S),
+                sink.send(message),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    eprintln!("rombie: the page stopped reading; dropping it");
+                    break;
+                }
             }
             if frame {
                 STATS.sent.fetch_add(1, Relaxed);
                 add_timing(&STATS.send_us, &STATS.send_max_us, started);
             }
         }
-    });
-    let stats = tokio::spawn(async move {
+    };
+    let stats_tx = out_tx.clone();
+    let stats = async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.tick().await;
         let mut last = std::time::Instant::now();
         loop {
             interval.tick().await;
             let now = std::time::Instant::now();
-            let _ = out_tx.try_send(Message::Text(take_stats_json(now - last).into()));
+            let _ = stats_tx.try_send(Message::Text(take_stats_json(now - last).into()));
             last = now;
         }
-    });
-
-    while let Some(Ok(message)) = source.next().await {
-        match message {
-            Message::Binary(data) => handle_message(&data),
-            Message::Close(_) => break,
-            _ => {}
+    };
+    let reader = async move {
+        while let Some(Ok(message)) = source.next().await {
+            match message {
+                Message::Binary(data) => handle_message(&data),
+                Message::Close(_) => break,
+                _ => {}
+            }
         }
+    };
+    tokio::select! {
+        _ = writer => {}
+        _ = stats => {}
+        _ = reader => {}
     }
 
-    CONNECTED.store(false, Relaxed);
     OUT.lock().unwrap().take();
-    stats.abort();
-    writer.abort();
-    eprintln!("rombie: the page left");
+    DISC_REPLY.lock().unwrap().take();
+    for pad in &PADS {
+        pad.store(0, Relaxed);
+    }
+    // A page that comes back (a reload) starts at normal speed.
+    SPEED_BITS.store(1.0f32.to_bits(), Relaxed);
+    mark_idle(if BOOTED.load(Relaxed) {
+        RECONNECT_GRACE_S
+    } else {
+        STARTUP_WAIT_S
+    });
 }
 
 fn handle_message(data: &[u8]) {
     match data.first() {
+        Some(&MSG_BOOT) if data.len() >= 16 => {
+            let size = u64::from_le_bytes(data[8..16].try_into().unwrap());
+            let name = String::from_utf8_lossy(&data[16..]).into_owned();
+            if BOOTED.load(Relaxed) || BOOT.lock().unwrap().is_some() {
+                send_event("error", "A game is already running in this engine.");
+            } else if !(MIN_ROM_SIZE..=MAX_ROM_SIZE).contains(&size) {
+                send_event("error", "That file is the wrong size for an N64 game.");
+            } else {
+                *BOOT.lock().unwrap() = Some((size, name));
+            }
+        }
+        Some(&MSG_DISC_DATA) if data.len() >= 8 => {
+            let id = u32::from_le_bytes(data[4..8].try_into().unwrap());
+            let mut reply = DISC_REPLY.lock().unwrap();
+            if reply.as_ref().is_some_and(|(want, _)| *want == id) {
+                let (_, tx) = reply.take().unwrap();
+                let _ = tx.send(data[8..].to_vec());
+            }
+        }
         Some(&MSG_PAD) if data.len() >= 8 && data[1] < 4 => {
             let word = u32::from_le_bytes(data[4..8].try_into().unwrap());
             let stick = |v: u32| (v as u8 as i8).clamp(-MAX_STICK, MAX_STICK) as u8 as u32;
@@ -206,11 +805,28 @@ fn handle_message(data: &[u8]) {
                 Relaxed,
             );
         }
+        Some(&MSG_CONTROL) if data.len() >= 2 => match data[1] {
+            CONTROL_PAUSE => PAUSE_WANTED.store(true, Relaxed),
+            CONTROL_RESUME => PAUSE_WANTED.store(false, Relaxed),
+            CONTROL_EXIT => EXIT_WANTED.store(true, Relaxed),
+            _ => {}
+        },
         Some(&MSG_PING) if data.len() >= 16 => {
             let page_ms = f64::from_le_bytes(data[8..16].try_into().unwrap());
             send(Message::Text(
                 format!(r#"{{"t":"pong","c":{page_ms:.3},"e":{:.3}}}"#, now_ms()).into(),
             ));
+        }
+        Some(&MSG_SPEED) if data.len() >= 8 => {
+            let ratio = f32::from_le_bytes(data[4..8].try_into().unwrap());
+            // NaN and anything up to 1 are normal speed.
+            let speed = if ratio > 1.0 {
+                ratio.min(MAX_SPEED)
+            } else {
+                1.0
+            };
+            SPEED_BITS.store(speed.to_bits(), Relaxed);
+            send_event("speed", &speed.to_string());
         }
         _ => {}
     }
@@ -222,7 +838,7 @@ fn take_stats_json(window: std::time::Duration) -> String {
     let readback_us = STATS.readback_us.swap(0, Relaxed);
     let send_us = STATS.send_us.swap(0, Relaxed);
     format!(
-        r#"{{"t":"stats","ms":{:.0},"vi":{},"grab":{},"sent":{},"drop":{},"w":{},"h":{},"hz":{:.3},"rb":{:.2},"rbMax":{:.2},"send":{:.2},"sendMax":{:.2},"af":{},"au":{}}}"#,
+        r#"{{"t":"stats","ms":{:.0},"vi":{},"grab":{},"sent":{},"drop":{},"w":{},"h":{},"hz":{:.3},"speed":{},"rb":{:.2},"rbMax":{:.2},"send":{:.2},"sendMax":{:.2},"af":{},"au":{}}}"#,
         window.as_secs_f64() * 1000.0,
         STATS.vis.swap(0, Relaxed),
         grabbed,
@@ -231,6 +847,7 @@ fn take_stats_json(window: std::time::Duration) -> String {
         STATS.width.load(Relaxed),
         STATS.height.load(Relaxed),
         STATS.hz_milli.load(Relaxed) as f64 / 1000.0,
+        speed(),
         if grabbed > 0 {
             readback_us as f64 / 1000.0 / grabbed as f64
         } else {
@@ -248,12 +865,33 @@ fn take_stats_json(window: std::time::Duration) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The emulation thread's side
+
 /// The port's pad word, as the page last sent it.
 pub fn pad(port: usize) -> u32 {
     PADS[port].load(Relaxed)
 }
 
-/// Emulation thread, at each VI: the moment the windowed build would draw the frame. Reads it back and queues it.
+/// At each VI, after the frame: holds the game while the page has it paused. True if it paused, so the pace starts
+/// again from now.
+pub fn pause_point() -> bool {
+    if !PAUSE_WANTED.load(Relaxed) || !keep_running() {
+        return false;
+    }
+    EMU_PAUSED.store(true, Relaxed);
+    send_event("paused", "");
+    while PAUSE_WANTED.load(Relaxed) && keep_running() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    EMU_PAUSED.store(false, Relaxed);
+    if keep_running() {
+        send_event("resumed", "");
+    }
+    true
+}
+
+/// At each VI: the moment the windowed build would draw the frame. Reads it back and queues it.
 pub fn send_frame(frame_time: f64) {
     STATS.vis.fetch_add(1, Relaxed);
     STATS.hz_milli.store((1000.0 / frame_time) as u32, Relaxed);
@@ -262,6 +900,12 @@ pub fn send_frame(frame_time: f64) {
         return;
     }
     let ready_ms = now_ms();
+    if speed() > 1.0
+        && ready_ms - f64::from_bits(LAST_FRAME_MS.load(Relaxed)) < FAST_FRAME_INTERVAL_MS
+    {
+        return;
+    }
+    LAST_FRAME_MS.store(ready_ms.to_bits(), Relaxed);
     let started = std::time::Instant::now();
     let mut message = Vec::new();
     let Some((width, height)) = ui::video::read_frame(&mut message, FRAME_HEADER_SIZE) else {
@@ -303,7 +947,8 @@ pub fn start_audio(stream: *mut sdl3_sys::audio::SDL_AudioStream) {
         let mut start = std::time::Instant::now();
         let mut frames_done = 0u64;
         while !AUDIO_STOP.load(Relaxed) {
-            if !connected() {
+            // With no page, or the game paused by it, nothing plays; start again from then.
+            if !connected() || EMU_PAUSED.load(Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(5));
                 start = std::time::Instant::now();
                 frames_done = 0;
@@ -357,4 +1002,234 @@ pub fn stop_audio() {
     if let Some(thread) = AUDIO_THREAD.lock().unwrap().take() {
         let _ = thread.join();
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Windows: the link's registration, message boxes, the exclusive port and the log
+
+/// Errors go to a message box, except for development runs, which have a console.
+fn report_error(message: &str, dev: bool) {
+    eprintln!("{message}");
+    if !dev {
+        win::message_box(message, true);
+    }
+}
+
+fn report_info(message: &str) {
+    win::message_box(message, false);
+}
+
+fn register() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let exe = exe.display();
+    win::register_link(
+        LINK_SCHEME,
+        "URL:Rombie N64 Engine",
+        &format!("\"{exe}\",0"),
+        &format!("\"{exe}\" --link \"%1\""),
+    )
+}
+
+fn unregister() -> bool {
+    win::unregister_link(LINK_SCHEME)
+}
+
+fn redirect_stderr(path: &std::path::Path) {
+    win::redirect_stderr(path);
+}
+
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
+    const KEY_WRITE: u32 = 0x20006;
+    const REG_SZ: u32 = 1;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const MB_ICONERROR: u32 = 0x10;
+    const MB_ICONINFORMATION: u32 = 0x40;
+    const SOL_SOCKET: i32 = 0xFFFF;
+    const SO_EXCLUSIVEADDRUSE: i32 = !4;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const IONBF: i32 = 0x0004;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegCreateKeyExW(
+            key: isize,
+            subkey: *const u16,
+            reserved: u32,
+            class: *const u16,
+            options: u32,
+            sam: u32,
+            security: *const c_void,
+            result: *mut isize,
+            disposition: *mut u32,
+        ) -> i32;
+        fn RegSetKeyValueW(
+            key: isize,
+            subkey: *const u16,
+            name: *const u16,
+            kind: u32,
+            data: *const c_void,
+            size: u32,
+        ) -> i32;
+        fn RegCloseKey(key: isize) -> i32;
+        fn RegDeleteTreeW(key: isize, subkey: *const u16) -> i32;
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(window: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn setsockopt(socket: usize, level: i32, name: i32, value: *const u8, size: i32) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetStdHandle(which: u32, handle: isize) -> i32;
+    }
+    unsafe extern "C" {
+        fn __acrt_iob_func(index: u32) -> *mut c_void;
+        fn _wfreopen(path: *const u16, mode: *const u16, stream: *mut c_void) -> *mut c_void;
+        fn setvbuf(stream: *mut c_void, buffer: *mut u8, mode: i32, size: usize) -> i32;
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    pub fn message_box(text: &str, error: bool) {
+        let kind = if error {
+            MB_ICONERROR
+        } else {
+            MB_ICONINFORMATION
+        };
+        unsafe {
+            MessageBoxW(
+                0,
+                wide(text).as_ptr(),
+                wide("Rombie N64 Engine").as_ptr(),
+                kind,
+            )
+        };
+    }
+
+    pub fn register_link(
+        scheme: &str,
+        description: &str,
+        icon: &str,
+        command: &str,
+    ) -> Result<(), String> {
+        let mut key = 0isize;
+        let path = wide(&format!("Software\\Classes\\{scheme}"));
+        let mut status = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                KEY_WRITE,
+                std::ptr::null(),
+                &mut key,
+                std::ptr::null_mut(),
+            )
+        };
+        if status == 0 {
+            let set = |subkey: Option<&str>, name: Option<&str>, value: &str| {
+                let subkey = subkey.map(wide);
+                let name = name.map(wide);
+                let value = wide(value);
+                unsafe {
+                    RegSetKeyValueW(
+                        key,
+                        subkey.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                        name.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                        REG_SZ,
+                        value.as_ptr() as *const c_void,
+                        (value.len() * 2) as u32,
+                    )
+                }
+            };
+            for (subkey, name, value) in [
+                (None, None, description),
+                (None, Some("URL Protocol"), ""),
+                (Some("DefaultIcon"), None, icon),
+                (Some("shell\\open\\command"), None, command),
+            ] {
+                if status == 0 {
+                    status = set(subkey, name, value);
+                }
+            }
+            unsafe { RegCloseKey(key) };
+        }
+        if status != 0 {
+            return Err(format!("Windows refused the change (error {status})."));
+        }
+        Ok(())
+    }
+
+    pub fn unregister_link(scheme: &str) -> bool {
+        let path = wide(&format!("Software\\Classes\\{scheme}"));
+        let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, path.as_ptr()) };
+        status == 0 || status == ERROR_FILE_NOT_FOUND
+    }
+
+    pub fn exclusive_address(socket: u64) {
+        let on: u32 = 1;
+        unsafe {
+            setsockopt(
+                socket as usize,
+                SOL_SOCKET,
+                SO_EXCLUSIVEADDRUSE,
+                &on as *const u32 as *const u8,
+                4,
+            )
+        };
+    }
+
+    /// The engine has no console. Rust's and the C runtime's stderr (parallel-rdp's log names the GPU) both go to the
+    /// file, appended so neither overwrites the other.
+    pub fn redirect_stderr(path: &std::path::Path) {
+        use std::os::windows::io::IntoRawHandle;
+        if std::fs::File::create(path).is_err() {
+            return;
+        }
+        if let Ok(file) = std::fs::OpenOptions::new().append(true).open(path) {
+            unsafe { SetStdHandle(STD_ERROR_HANDLE, file.into_raw_handle() as isize) };
+        }
+        let path: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let stderr = __acrt_iob_func(2);
+            if !_wfreopen(path.as_ptr(), wide("a").as_ptr(), stderr).is_null() {
+                setvbuf(stderr, std::ptr::null_mut(), IONBF, 0);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod win {
+    pub fn message_box(_text: &str, _error: bool) {}
+
+    pub fn register_link(
+        _scheme: &str,
+        _description: &str,
+        _icon: &str,
+        _command: &str,
+    ) -> Result<(), String> {
+        Err("The Rombie N64 engine is Windows-only.".into())
+    }
+
+    pub fn unregister_link(_scheme: &str) -> bool {
+        false
+    }
+
+    pub fn redirect_stderr(_path: &std::path::Path) {}
 }

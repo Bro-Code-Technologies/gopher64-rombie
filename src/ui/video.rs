@@ -259,7 +259,7 @@ pub fn check_callback(device: &mut device::Device) -> (bool, bool) {
     let mut speed_limiter_toggled = false;
     let callback = unsafe { rdp_check_callback() };
     device.cpu.running =
-        callback.emu_running && (!crate::rombie::active() || crate::rombie::connected());
+        callback.emu_running && (!crate::rombie::active() || crate::rombie::keep_running());
     if device.netplay.is_none() {
         if callback.save_state {
             device.savestate.save_state = true;

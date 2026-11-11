@@ -109,6 +109,11 @@ fn set_app_id() {
     }
 }
 
+/// The Rombie engine build's launch modes (docs/rombie/notes.md). None leaves the command line to gopher64.
+pub fn rombie_main() -> Option<i32> {
+    rombie::main()
+}
+
 pub fn create_runtime() -> (tokio::sync::oneshot::Sender<()>, tokio::runtime::Handle) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();

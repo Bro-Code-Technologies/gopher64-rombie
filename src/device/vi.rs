@@ -147,6 +147,10 @@ pub fn update_screen(device: &mut device::Device) {
         let _ = device.ui.video.vis_tx.as_ref().unwrap().send(true);
     }
 
+    if crate::rombie::active() && crate::rombie::pause_point() {
+        reset_pace_deadline(device);
+    }
+
     if device.netplay.is_some() {
         device.netplay.as_mut().unwrap().inputs = netplay::process_requests(device);
     } else if paused {
@@ -202,10 +206,13 @@ pub fn init(device: &mut device::Device) {
 
 fn speed_limiter(device: &mut device::Device) {
     let mut speed_limiter_toggled = false;
-    #[cfg_attr(not(feature = "upstream-extras"), allow(unused_mut))]
     let mut interval = std::time::Duration::from_secs_f64(
         device.vi.frame_time * device.speed_limiter.limit_freq as f64,
     );
+    // Rombie's engine mode: the page's fast-forward.
+    if crate::rombie::active() {
+        interval = interval.div_f64(crate::rombie::speed_ratio());
+    }
 
     #[cfg(feature = "upstream-extras")]
     if let Some(netplay) = &device.netplay {

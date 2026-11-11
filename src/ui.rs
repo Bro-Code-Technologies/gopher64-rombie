@@ -208,6 +208,9 @@ pub fn get_dirs() -> Dirs {
 
     #[cfg(not(target_os = "android"))]
     {
+        if let Some(dirs) = crate::rombie::dirs() {
+            return dirs;
+        }
         let exe_path = std::env::current_exe().unwrap();
         let portable_dir = exe_path.parent();
         let portable = portable_dir.unwrap().join("portable.txt").exists();

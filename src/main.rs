@@ -9,6 +9,12 @@ fn main() -> std::io::Result<()> {
     let (close_tx, handle) = gopher64::create_runtime();
     let _guard = handle.enter();
 
+    #[cfg(not(feature = "gui"))]
+    if let Some(code) = gopher64::rombie_main() {
+        close_tx.send(()).unwrap();
+        std::process::exit(code);
+    }
+
     let args = gopher64::Args::parse();
     let result = gopher64::run(args, std::env::args().count());
     close_tx.send(()).unwrap();

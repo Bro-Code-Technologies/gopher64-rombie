@@ -57,9 +57,9 @@ default build is unchanged. The engine build (`--no-default-features`) has none 
 - The cheat list, `data/cheats.json`. The engine build finds no cheats.
 
 gopher64's `tokio` dependency now names the features its own code uses (`sync`, `macros`, `time`, `net`, `io-util`).
-The left-out crates used to turn them on for it. SDL_ttf with FreeType and Roboto Mono stay for now, since gopher64's
-window draws its on-screen text with them. Phase 3's windowless engine draws no text, so they can go once the engine
-build has no window.
+The left-out crates used to turn them on for it. SDL_ttf with FreeType and Roboto Mono stay, since gopher64's window
+draws its on-screen text with them, and the engine build still opens that window for development runs
+(`gopher64.exe <rom>`). Engine mode draws no text.
 
 The engine build compiles 139 crates (the table below), down from Phase 1's 382, and none of the left-out ones. Its exe
 holds no cheat text and no URL but error-message links (clap, libbzip2, PIX).
@@ -85,10 +85,63 @@ With `GOPHER64_ROMBIE_SPEED_LOG` naming a file, the engine writes a line to it f
 (`f <microseconds> <frame time in ns>`) and each audio underrun (`u <microseconds> <bytes>`: SDL asked for more sound
 than was queued, and got silence). Unset, it does nothing. Phase 2's speed table is worked out from it.
 
-## Windowless spike (plan Phase 3)
+## Engine mode (plan Phases 3 and 4)
 
-With `GOPHER64_ROMBIE_SPIKE_PORT` set, `gopher64.exe <rom> [--load-state <slot>]` runs in engine mode, the core of
-what Phase 4 makes the engine. Unset, nothing changes. `src/rombie.rs` holds it, and its header lists the messages:
+`src/rombie.rs` holds it, and its header lists every message. Phase 3 built it as a spike started by an environment
+variable; Phase 4 made it the engine below, and the variable is gone. Upstream's default build never enters it.
+
+### Launch modes
+
+The engine build (`--no-default-features`) reads its command line before gopher64 does (`main.rs`, then
+`rombie::main`), as pcsx2-rombie's and xemu-rombie's engines do:
+
+```
+(no arguments)                            first run: register rombie-n64:// for this Windows user (HKCU, no admin), then exit
+--link <url>                              started by the link: serve the page with that URL's key, exit when it's gone
+--unregister                              remove the registration
+--key <key> [--port <p>] [--origin <o>]   development: serve pages presenting <key>; --origin also admits pages from <o>
+--version                                 print the version (rombie/VERSION)
+```
+
+Any other command line is gopher64's own, so `gopher64.exe <rom>` still opens gopher64's window for development runs
+like Phase 2's speed test.
+
+- **The registration** is `HKCU\Software\Classes\rombie-n64`, with `shell\open\command` = `"<exe>" --link "%1"`.
+  Running the exe again from a new folder points it there. Browsers show the exe's version resource name, "Rombie N64
+  Engine" (`build.rs`, the engine build only), in their prompt.
+- **Who may connect.** The engine listens on 127.0.0.1:47654 only, with `SO_EXCLUSIVEADDRUSE`. A page must come from
+  `https://rombie.app`, `https://staged.rombie.app` or the dev server (`http://localhost:5173`,
+  `http://127.0.0.1:5173`), or from `--origin` in development; anything else, or no `Origin`, gets a 403. It must
+  present the current key. One page at a time. Refusals a page should understand complete the handshake and close at
+  once with a code: 4001 the key isn't this engine's, 4002 another page is playing, 4003 the game is stopping.
+- **Started on demand.** Rombie opens `rombie-n64://start?key=<random key>`, and Windows runs the engine with
+  `--link <url>`. If an engine already holds the port, the new one hands it the key (`GET /handoff` with an
+  `X-Rombie-Handoff` header, which a web page can't send without a CORS preflight the engine never answers) and exits.
+  An idle engine takes it (204); a busy one says 409, and the page hears 4002 from it.
+- **Lifetime.** A link-started engine exits 60 seconds after starting if no page connects, and a running game ends 10
+  seconds after its page goes, so a reload can come back to it. A page that stops reading for 10 seconds is dropped.
+  One game per process: the process ends when the game stops.
+- **Its own folders.** `%LOCALAPPDATA%\RombieN64` (`RombieN64-<port>` for a development engine on another port), with
+  gopher64's `config` there, so it never shares settings with a gopher64 the player installed. A link start writes
+  `engine.log` there, both Rust's and the C runtime's stderr, so parallel-rdp's line naming the GPU is in it. Only the
+  engine holding the port writes it.
+- **No windows.** The exe is a Windows-subsystem app, so a link start shows nothing. Setup and errors use message
+  boxes; a development run prints errors instead.
+
+### Where the protocol differs from pcsx2-rombie's
+
+- **Boot** (`0x01`) has no BIOS: `[u8 type][3 pad][u32 0][u64 ROM size][ROM name]`. The ROM must be 4 KB to 64 MB.
+- **The ROM** is read whole before the boot, with the disc messages (`0x81`, `0x02`) in 1 MB chunks, and kept in memory
+  only. `device::swap_rom` puts a `.v64`'s or an `.n64`'s byte order right, and a file it doesn't recognize gets the
+  event "error" and no boot.
+- **Pad** (`0x03`) is the port's pad word as the N64 reads it: buttons in bits 0-13 in the N64's order, then the
+  stick's x and y as signed bytes, +y up, clamped to 85 either way.
+- **Pong** is pcsx2-rombie's: `{"t":"pong","c":<page time>,"e":<engine time>}`.
+- **Events**: booted (with the ROM's name, sent again to a page that comes back), paused, resumed, speed, stopped and
+  error. After "stopped" the engine closes the connection normally (1000, "stopped") and exits.
+- **Not yet**: save states and the game data blob (Phase 5), lockstep (Phase 6).
+
+### What the engine is, whatever the config says
 
 - **No window.** `rdp_init` in `parallel-rdp/interface.cpp` takes a null window to mean engine mode: it creates
   Granite's Vulkan context and device with no surface and no WSI. With no surface to match, Granite takes the discrete
@@ -105,10 +158,31 @@ what Phase 4 makes the engine. Unset, nothing changes. `src/rombie.rs` holds it,
   gopher64's own pacing stays: the stream's get callback pads a shortfall with silence and nudges the rate. While the
   game's AI is idle (where gopher64 pauses its sound device), the thread keeps the clock and sends silence, as a paused
   device plays it. Stopping instead drained the page's buffer by each pause: GoldenEye's emptied in 33 seconds.
-- **Pads.** The page sends each port's pad word as the N64 reads it. All four ports are on, and gopher64's own keyboard
-  and pad input isn't opened, so nothing else reaches the game.
-- **The page.** One page, on `127.0.0.1` only, with no key or origin check yet (Phase 4). The game starts once it
-  connects and ends when it leaves. Rombie's `engine/n64/engine-test.html` is that page.
+- **Pads.** All four ports are on, each with a Controller Pak, and the Expansion Pak is in. gopher64's own keyboard and
+  pad input isn't opened, so nothing but the page reaches the game. gopher64 gives Chameleon Twist (`NCT`) a Rumble Pak
+  instead, as it doesn't work with a Controller Pak; the engine leaves that be, and nothing vibrates.
+- **Controls.** Pause holds the game at its next VI, until resume, exit or the page's grace runs out. Fast-forward
+  divides the VI pace by the page's ratio (at most 10). While fast, the engine sends about one frame per display
+  refresh, and gopher64's own audio queue drops what the 48 kHz pull can't take.
+- **Saves.** `ui::storage::write_saves` writes nothing in engine mode, so no game's save reaches the engine's folder.
+  They stay in memory until Phase 5 sends them to the page.
+- **Settings** gopher64 reads from its config are set for the run: no Transfer Pak, VRU, USB, rewind or overclock,
+  not fullscreen, and the picture as above.
+
+### Packaging
+
+`rombie/package.ps1` makes the release zip and `rombie/RELEASING.md` says how a release goes out. The zip holds
+`rombie-n64-engine.exe`, gopher64's `LICENSE` as `LICENSE.txt`, a `README.txt` naming the release's tag as the source,
+and `licenses\THIRD-PARTY.txt`:
+
+- the notices in `rombie/licenses/`: volk's and the Vulkan headers' (both from the submodule's headers, which carry no
+  license file), X-Scale's (from mupen64plus-core's `n64_cic_nus_6105.c` at `a9ca8ec`), and Roboto Mono's, which is
+  under the SIL Open Font License 1.1 by its own name table, not Apache-2.0 as the Phase 1 scan below says (its
+  `OFL.txt` from github.com/googlefonts/RobotoMono);
+- parallel-rdp's `LICENSE`;
+- SDL (with HIDAPI's BSD licence and yuv2rgb's), SDL_ttf with FreeType's licence and the FreeType License, mimalloc and
+  zstd, from the crates that build them;
+- every crate `cargo tree -e normal` lists, with its own license files. All 138 have them.
 
 ## License scan (plan Phase 1)
 
@@ -135,7 +209,8 @@ out:
     - zstd 1.5.7 (BSD-3-Clause or GPL-2.0; BSD is taken).
     - ring 0.17.14 (ISC, and Apache-2.0 for its BoringSSL code; no OpenSSL-licensed code).
 - **Embedded data**:
-  - `data/ui/RobotoMono-Regular.ttf`: Roboto Mono, Apache-2.0. The repo has no copy of its licence.
+  - `data/ui/RobotoMono-Regular.ttf`: Roboto Mono, Apache-2.0. The repo has no copy of its licence. (Corrected in
+    Phase 4: version 3.001, which this is, is under the SIL Open Font License 1.1, as its name table says.)
   - `data/cheats.json`: a cheat list with no stated source.
   - gopher64's shaders and icon.
   - The No-Intro DAT under `data/ui/` is read by the GUI only.
