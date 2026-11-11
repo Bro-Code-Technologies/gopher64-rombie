@@ -792,7 +792,9 @@ RDP_FRAME rdp_read_frame() {
 
 void rdp_update_screen() {
   if (headless_device) {
-    headless_device->next_frame_context();
+    // Flushes the RDP's open command buffer first, which next_frame_context waits for. A frame's readback does that
+    // too, but with no page there's none, and the RDP thread only flushes a few primitives once the game sends more.
+    processor->begin_frame_context();
     return;
   }
   if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) {

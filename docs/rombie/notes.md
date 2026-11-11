@@ -31,6 +31,7 @@ README's notice at the top points here. Each change is in its own section below.
 | 2026-11-10 | `eb3eda0` | The engine: launch modes and the `rombie-n64://` link, guarded connections, the boot from the page's ROM, pause, resume, exit and fast-forward, its own folder and log, no saves written, the version resource, and the release zip (Phase 4) |
 | 2026-11-10 | `10d1b24` and the commit after it | The Visual C++ runtime in the zip, the full source archive, the README's notice, and `build.rs` reading `rombie/GIT_DESCRIBE` in the archive (Phase 4.1) |
 | 2026-11-10 | `e74ef10` and the commit after it | Game data and save states to and from the page, states only on the engine version that made them, and a separate queue for frames and sound (Phase 5) |
+| 2026-11-10 | the commit after `249c7b8` | With no page, the frame context flushes the RDP first, so a game whose page left stops instead of hanging (Phase 5) |
 
 ## Building (Windows)
 
@@ -202,6 +203,12 @@ answered with `0x84`, `0x07` load state answered with the event "state-loaded" (
   alpha forced opaque. The engine time in the message is taken before the readback, so the page's delay includes it.
   `rdp_update_screen` moves Granite to its next frame context, as the swapchain's frame did. 1x, with no supersampling,
   widescreen or CRT, whatever the config says.
+- **The frame context with no page.** `rdp_update_screen` calls parallel-rdp's `begin_frame_context`, which flushes the
+  RDP's command buffer and drains its ring before Granite's `next_frame_context`. That call waits for every command
+  buffer to be submitted. The readback flushes too, but with no page there is none. Then a few primitives the game sent
+  since its last full sync stayed open: the RDP thread flushes on its own only past 32 primitives or 2 render passes,
+  and the game was waiting at the VI. Majora's Mask hung that way when its page left, the game never stopped, and the
+  engine refused every page with 4003 until it was killed.
 - **Sound.** The game's audio stream converts to 48 kHz stereo float with no device behind it. A thread pulls it at
   48 kHz by the clock, as a sound card would, and sends blocks of 256 to 2048 frames, as pcsx2-rombie's audio does.
   gopher64's own pacing stays: the stream's get callback pads a shortfall with silence and nudges the rate. While the
