@@ -61,7 +61,7 @@ one.
    It stops if the tree has changes, so both files are the commit you tag. It writes two files to `dist\`, which git
    doesn't track, and prints their SHA-256s:
    - `rombie-n64-engine-<version>-windows-x64.zip` (about 5 MB): the engine as `rombie-n64-engine.exe`,
-     `msvcp140.dll` and `vcruntime140.dll` from Visual Studio's redist for its toolset, gopher64's `LICENSE` as
+     `msvcp140.dll`, `vcruntime140.dll` and `vcruntime140_1.dll` from Visual Studio's redist for its toolset, gopher64's `LICENSE` as
      `LICENSE.txt`, a `README.txt` (setup, the modification notice, the source archive, Microsoft's terms for the
      runtime) and `licenses\THIRD-PARTY.txt`. That holds the notices in `rombie\licenses\`, parallel-rdp's, the C
      libraries the crates build from source, and every crate the engine compiles with its license files. It stops if
@@ -144,7 +144,7 @@ Setup details are in Rombie's Docs page.
 
 The N64 engine is free software under the GNU GPL v3, as gopher64 is. It's a modified version of gopher64, changed by Bro Code Technologies for Rombie since 2026-11-10; `docs/rombie/notes.md` lists the changes. The complete source for this release is `rombie-n64-engine-<version>-source.zip` below, which builds the engine offline with every submodule and crate it needs. It's the commit tagged `rombie-n64-engine-<version>` in this repository.
 
-`msvcp140.dll` and `vcruntime140.dll` in the zip are Microsoft's Visual C++ runtime, distributed under the [Visual Studio 2022 license terms](https://visualstudio.microsoft.com/license-terms/vs2022-ga-community/).
+`msvcp140.dll`, `vcruntime140.dll` and `vcruntime140_1.dll` in the zip are Microsoft's Visual C++ runtime, distributed under the [Visual Studio 2022 license terms](https://visualstudio.microsoft.com/license-terms/vs2022-ga-community/).
 
 SHA-256:
 - `rombie-n64-engine-<version>-windows-x64.zip`: `<sha-256>`

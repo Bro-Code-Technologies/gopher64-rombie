@@ -28,13 +28,14 @@ if ($built -ne $version) { throw "$exe says '$built', not $version. Build it wit
 Copy-Item $exe "$stage\rombie-n64-engine.exe"
 Copy-Item LICENSE "$stage\LICENSE.txt"
 
-# The Visual C++ runtime the exe needs (dumpbin /dependents: msvcp140.dll and vcruntime140.dll; the api-ms-win-crt-*
-# ones are Windows' own), app-local, so nobody has to install the Visual C++ Redistributable first. Visual Studio's own
-# redist for its toolset, as the PS2 engine's package.ps1 takes it.
+# The Visual C++ runtime the exe needs, app-local, so nobody has to install the Visual C++ Redistributable first:
+# msvcp140.dll and vcruntime140.dll (dumpbin /dependents; the api-ms-win-crt-* ones are Windows' own), and
+# vcruntime140_1.dll, which msvcp140.dll imports. Visual Studio's own redist for its toolset, as the PS2 engine's
+# package.ps1 takes it.
 $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -version '[17,18)' -latest -property installationPath
 $redistVersion = (Get-Content "$vs\VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt").Trim()
 $crt = "$vs\VC\Redist\MSVC\$redistVersion\x64\Microsoft.VC143.CRT"
-foreach ($dll in 'msvcp140', 'vcruntime140') { Copy-Item "$crt\$dll.dll" $stage }
+foreach ($dll in 'msvcp140', 'vcruntime140', 'vcruntime140_1') { Copy-Item "$crt\$dll.dll" $stage }
 
 $utf8 = New-Object System.Text.UTF8Encoding $false
 $rule = '=' * 78
@@ -138,9 +139,10 @@ Source code
   rombie-n64-engine-$version of https://github.com/Bro-Code-Technologies/gopher64-rombie.
 
 Microsoft files
-  msvcp140.dll and vcruntime140.dll (the Visual C++ runtime) are Microsoft's, distributed with the engine under the
-  Visual Studio 2022 license terms at https://visualstudio.microsoft.com/license-terms/vs2022-ga-community/. You may
-  use them only as part of the engine, and you may not modify, reverse engineer or distribute them separately.
+  msvcp140.dll, vcruntime140.dll and vcruntime140_1.dll (the Visual C++ runtime) are Microsoft's, distributed with the
+  engine under the Visual Studio 2022 license terms at
+  https://visualstudio.microsoft.com/license-terms/vs2022-ga-community/. You may use them only as part of the engine,
+  and you may not modify, reverse engineer or distribute them separately.
   Microsoft provides them as is, without any warranty, and is not liable for any damages arising from them.
 "@
 [IO.File]::WriteAllText((Join-Path (Resolve-Path $stage) 'README.txt'), ($readme -replace "`r?`n", "`r`n"), $utf8)
