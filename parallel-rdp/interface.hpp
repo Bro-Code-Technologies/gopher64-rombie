@@ -53,17 +53,21 @@ typedef enum {
 } MESSAGE_LENGTH;
 
 // Rombie's engine mode (docs/rombie/notes.md): a null window renders on a
-// Vulkan device with no surface, and rdp_read_frame stands in for drawing.
+// Vulkan device with no surface, and a frame read back stands in for drawing:
+// rdp_start_frame where the game runs, rdp_finish_frame on any thread.
 bool rdp_init(void *_window, GFX_INFO _gfx_info, const void *font,
               size_t font_size, uint32_t save_state_slot);
 
 typedef struct {
-  const uint8_t *pixels; // RGBA, width * 4 bytes a row; null if no frame
+  void *frame; // null if no frame
   uint32_t width;
   uint32_t height;
 } RDP_FRAME;
 
-RDP_FRAME rdp_read_frame();
+RDP_FRAME rdp_start_frame();
+// Waits for the GPU, copies the frame as RGBA (width * 4 bytes a row) to rgba,
+// and frees it.
+void rdp_finish_frame(void *frame, uint8_t *rgba);
 void rdp_close();
 void rdp_set_vi_register(uint32_t reg, uint32_t value);
 void rdp_update_screen();

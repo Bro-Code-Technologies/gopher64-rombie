@@ -35,6 +35,7 @@ README's notice at the top points here. Each change is in its own section below.
 | 2026-11-11 | the commit after `2f54a66` | Lockstep and netplay for Rombie's page: the page's input for each VI, the RNG and the cart clock pinned, full syncs waited for, the state's hashes, and a new RDP before a netplay load (Phase 6) |
 | 2026-11-11 | the commit after `a301767` | The log names the GPU in use (Phase 6) |
 | 2026-11-11 | the commit after `38ab61f` | The full-sync wait, the speed limiter's sleep and the hashing timed in the stats, and RDRAM dumps for the lockstep checks (Phase 6) |
+| 2026-11-11 | the commit after `7c2d8b3` | Frames read back on their own thread while the game runs on, the frame context's wait in the stats, and no subgroups on Intel GPUs (Phase 6) |
 
 ## Building (Windows)
 
@@ -232,8 +233,16 @@ hosts, joins or ends netplay in a running game. `src/rombie.rs`'s header has the
   in the first try). So both sides drop parallel-rdp's command processor and make a new one
   (`rdp_reset_processor` in `parallel-rdp/interface.cpp`) before loading. After that, a replay from the state matched
   its recording at every VI. pcsx2-rombie reboots at a handoff instead; the N64 needs only the new RDP.
+- **No subgroups on Intel GPUs.** On a laptop's Intel UHD Graphics 630 (Vulkan 1.2, driver 0.402.1472), RDRAM
+  differed from the main PC's from a replay's first VI, in frame-buffer-sized ranges (110 KB in Mario Kart 64, 175 KB
+  in Super Smash Bros., which reads its frame buffer back, so its whole state drifted). The same laptop's GTX 1060
+  matched byte for byte. parallel-rdp's `PARALLEL_RDP_SUBGROUP=0` (no subgroup tile binning) made the Intel GPU match
+  at every VI, and so did its ubershader at a third of the speed or less. So on an Intel GPU, `init_headless` in
+  `parallel-rdp/interface.cpp` sets `PARALLEL_RDP_SUBGROUP=0` before the processor is made, unless it's set already;
+  the log shows "Allow subgroups = 0". The picture there is right, not only the same as other PCs'.
 - **For the checks.** The stats line also carries `"fs"`, the ms the game waited for full syncs, `"idle"`, the ms the
-  speed limiter slept (how far ahead of the clock the PC is), and `"hash"`, the ms spent hashing. With
+  speed limiter slept (how far ahead of the clock the PC is), `"fc"`, the ms it waited moving to the next frame
+  context (see Frames), and `"hash"`, the ms spent hashing. With
   `ROMBIE_DUMP_RDRAM` naming a folder, the RDRAM of the first three hashed VIs goes there as `<game>-<VI>.bin`, to find
   where two PCs' RDRAM differs.
 - **On the main PC** (Ryzen 9 5950X, RTX 5070 Ti), with Rombie's `engine/n64/lockstep-test.html`: a ten-minute
@@ -253,11 +262,16 @@ hosts, joins or ends netplay in a running game. `src/rombie.rs`'s header has the
   own) picks the nth GPU in the order the log lists them, for the Intel UHD run of Phase 6. Granite's "Found Vulkan
   GPU" lines list every GPU, so the engine adds "Using Vulkan GPU" with the one it took. SDL's video and TTF aren't
   started, and on-screen messages are dropped.
-- **Frames.** At each VI, where the windowed build draws, `rdp_read_frame` reads parallel-rdp's scanout back at the
-  VI's own size (`scanout_sync`, the same scanout options as the window) and `rombie::send_frame` sends it as RGBA,
-  alpha forced opaque. The engine time in the message is taken before the readback, so the page's delay includes it.
-  `rdp_update_screen` moves Granite to its next frame context, as the swapchain's frame did. 1x, with no supersampling,
-  widescreen or CRT, whatever the config says.
+- **Frames.** At each VI, where the windowed build draws, `rombie::send_frame` calls `rdp_start_frame`, which records
+  parallel-rdp's scanout at the VI's own size and its copy back (`scanout_async_buffer`, the same scanout options as
+  the window). A readback thread then waits for the GPU (`rdp_finish_frame`) and sends the frame as RGBA, alpha forced
+  opaque, so the game runs on meanwhile. Reading it back on the game's thread (`scanout_sync`) cost a GTX 1060 laptop
+  2.4 to 3.2 ms a VI, a sixth of each second, and kept it under full speed. At most three frames wait for the GPU;
+  past that a frame is dropped. The engine time in the message is taken before the readback, so the page's delay
+  includes it. `rdp_update_screen` moves Granite to its next frame context, as the swapchain's frame did; with two
+  contexts, that waits for the VI before's GPU work, so a frame is read back by then at the latest. Before the RDP
+  closes, `ui::video::close` waits for the readback thread. 1x, with no supersampling, widescreen or CRT, whatever
+  the config says.
 - **The frame context with no page.** `rdp_update_screen` calls parallel-rdp's `begin_frame_context`, which flushes the
   RDP's command buffer and drains its ring before Granite's `next_frame_context`. That call waits for every command
   buffer to be submitted. The readback flushes too, but with no page there is none. Then a few primitives the game sent

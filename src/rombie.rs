@@ -51,8 +51,8 @@
 //! Engine to page (text, JSON): hello {"t":"hello","engine","version","protocol","gopher64"}, event
 //! {"t":"event","what","detail"} (booted, paused, resumed, speed, state-loaded, state-version, netplay, stopped, error),
 //! stats (once a second; "lw" is the ms it waited for lockstep input, "fs" for the GPU's full syncs in lockstep, "idle"
-//! the ms the speed limiter slept, "hash" the ms spent hashing), and pong {"t":"pong","c":<page time>,"e":<engine
-//! time>}.
+//! the ms the speed limiter slept, "hash" the ms spent hashing, "fc" the ms moving to the next frame context), and pong
+//! {"t":"pong","c":<page time>,"e":<engine time>}.
 //!
 //! The game data blob is the game's one stored object: "RN64", u32 version 1, then u32 lengths of the EEPROM, SRAM,
 //! FlashRAM and the four Controller Paks (each 0 or its full size: 2 KB, 32 KB, 128 KB, 4 x 32 KB), then those bytes.
@@ -63,7 +63,10 @@
 //! One game per process: it boots when the page's boot message comes, and the process ends when the game stops.
 use crate::{device, ui};
 use futures::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU32, AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -135,6 +138,8 @@ const PAD_BUTTONS: u32 = 0x3FFF;
 /// Messages waiting for the page. A frame that finds the queue full is dropped, so a page that falls behind gets
 /// the newer frames rather than a growing delay.
 const SEND_QUEUE: usize = 16;
+/// A GPU this far behind loses frames rather than queueing them.
+const MAX_FRAMES_IN_FLIGHT: u32 = 3;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -168,6 +173,10 @@ static EMU_PAUSED: AtomicBool = AtomicBool::new(false);
 static FRAME_NO: AtomicU32 = AtomicU32::new(0);
 static VI_NO: AtomicU32 = AtomicU32::new(0);
 static LAST_FRAME_MS: AtomicU64 = AtomicU64::new(0);
+/// Frames started and not yet finished by the readback thread, which has them in order.
+static FRAMES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+static READBACK: std::sync::OnceLock<std::sync::mpsc::Sender<PendingFrame>> =
+    std::sync::OnceLock::new();
 static AUDIO_PAUSED: AtomicBool = AtomicBool::new(true);
 static AUDIO_STOP: AtomicBool = AtomicBool::new(false);
 static AUDIO_THREAD: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
@@ -239,6 +248,7 @@ struct Stats {
     full_sync_us: AtomicU64,
     idle_us: AtomicU64,
     hash_us: AtomicU64,
+    frame_context_us: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -259,6 +269,7 @@ static STATS: Stats = Stats {
     full_sync_us: AtomicU64::new(0),
     idle_us: AtomicU64::new(0),
     hash_us: AtomicU64::new(0),
+    frame_context_us: AtomicU64::new(0),
 };
 
 pub fn active() -> bool {
@@ -1050,7 +1061,7 @@ fn take_stats_json(window: std::time::Duration) -> String {
     let readback_us = STATS.readback_us.swap(0, Relaxed);
     let send_us = STATS.send_us.swap(0, Relaxed);
     format!(
-        r#"{{"t":"stats","ms":{:.0},"vi":{},"grab":{},"sent":{},"drop":{},"w":{},"h":{},"hz":{:.3},"speed":{},"rb":{:.2},"rbMax":{:.2},"send":{:.2},"sendMax":{:.2},"af":{},"au":{},"lw":{:.1},"fs":{:.1},"idle":{:.1},"hash":{:.1}}}"#,
+        r#"{{"t":"stats","ms":{:.0},"vi":{},"grab":{},"sent":{},"drop":{},"w":{},"h":{},"hz":{:.3},"speed":{},"rb":{:.2},"rbMax":{:.2},"send":{:.2},"sendMax":{:.2},"af":{},"au":{},"lw":{:.1},"fs":{:.1},"idle":{:.1},"hash":{:.1},"fc":{:.1}}}"#,
         window.as_secs_f64() * 1000.0,
         STATS.vis.swap(0, Relaxed),
         grabbed,
@@ -1078,6 +1089,7 @@ fn take_stats_json(window: std::time::Duration) -> String {
         STATS.full_sync_us.swap(0, Relaxed) as f64 / 1000.0,
         STATS.idle_us.swap(0, Relaxed) as f64 / 1000.0,
         STATS.hash_us.swap(0, Relaxed) as f64 / 1000.0,
+        STATS.frame_context_us.swap(0, Relaxed) as f64 / 1000.0,
     )
 }
 
@@ -1091,6 +1103,14 @@ pub fn add_full_sync_time(started: std::time::Instant) {
 /// The stats' `"idle"`: time the speed limiter slept, which is how far ahead of the clock the PC is.
 pub fn add_idle_time(slept: std::time::Duration) {
     STATS.idle_us.fetch_add(slept.as_micros() as u64, Relaxed);
+}
+
+/// The stats' `"fc"`: time the game waited moving to Granite's next frame context, which waits for the GPU's work from
+/// the VI before (a frame read back while the game runs is finished there at the latest).
+pub fn add_frame_context_time(started: std::time::Instant) {
+    STATS
+        .frame_context_us
+        .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1570,7 +1590,14 @@ pub fn send_game_data(storage: &mut ui::Storage, force: bool) {
     send(Message::Binary(message.into()));
 }
 
-/// At each VI: the moment the windowed build would draw the frame. Reads it back and queues it.
+struct PendingFrame {
+    frame: ui::video::Frame,
+    ready_ms: f64,
+    vi_no: u32,
+}
+
+/// At each VI: the moment the windowed build would draw the frame. Starts its readback, which the readback thread
+/// finishes and queues. The stats' `"rb"` is the game's part.
 pub fn send_frame(frame_time: f64) {
     STATS.vis.fetch_add(1, Relaxed);
     STATS.hz_milli.store((1000.0 / frame_time) as u32, Relaxed);
@@ -1585,28 +1612,59 @@ pub fn send_frame(frame_time: f64) {
         return;
     }
     LAST_FRAME_MS.store(ready_ms.to_bits(), Relaxed);
+    if FRAMES_IN_FLIGHT.load(Acquire) >= MAX_FRAMES_IN_FLIGHT {
+        STATS.dropped.fetch_add(1, Relaxed);
+        return;
+    }
     let started = std::time::Instant::now();
-    let mut message = Vec::new();
-    let Some((width, height)) = ui::video::read_frame(&mut message, FRAME_HEADER_SIZE) else {
+    let Some(frame) = ui::video::start_frame() else {
         return;
     };
-    // The VI's alpha isn't display opacity; a canvas would show these pixels dimmed or see-through.
-    for alpha in message[FRAME_HEADER_SIZE + 3..].iter_mut().step_by(4) {
-        *alpha = 0xFF;
-    }
-    let frame_no = FRAME_NO.fetch_add(1, Relaxed) + 1;
-    message[0] = MSG_FRAME;
-    message[4..8].copy_from_slice(&frame_no.to_le_bytes());
-    message[8..16].copy_from_slice(&ready_ms.to_le_bytes());
-    message[16..18].copy_from_slice(&(width as u16).to_le_bytes());
-    message[18..20].copy_from_slice(&(height as u16).to_le_bytes());
-    message[20..24].copy_from_slice(&vi_no.to_le_bytes());
     add_timing(&STATS.readback_us, &STATS.readback_max_us, started);
     STATS.grabbed.fetch_add(1, Relaxed);
-    STATS.width.store(width, Relaxed);
-    STATS.height.store(height, Relaxed);
-    if !send_media(Message::Binary(message.into())) {
-        STATS.dropped.fetch_add(1, Relaxed);
+    STATS.width.store(frame.width, Relaxed);
+    STATS.height.store(frame.height, Relaxed);
+    FRAMES_IN_FLIGHT.fetch_add(1, Relaxed);
+    let _ = readback_thread().send(PendingFrame {
+        frame,
+        ready_ms,
+        vi_no,
+    });
+}
+
+fn readback_thread() -> &'static std::sync::mpsc::Sender<PendingFrame> {
+    READBACK.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<PendingFrame>();
+        std::thread::spawn(move || {
+            for pending in rx {
+                let (width, height) = (pending.frame.width, pending.frame.height);
+                let mut message = Vec::new();
+                ui::video::finish_frame(pending.frame, &mut message, FRAME_HEADER_SIZE);
+                FRAMES_IN_FLIGHT.fetch_sub(1, Release);
+                // The VI's alpha isn't display opacity; a canvas would show these pixels dimmed or see-through.
+                for alpha in message[FRAME_HEADER_SIZE + 3..].iter_mut().step_by(4) {
+                    *alpha = 0xFF;
+                }
+                let frame_no = FRAME_NO.fetch_add(1, Relaxed) + 1;
+                message[0] = MSG_FRAME;
+                message[4..8].copy_from_slice(&frame_no.to_le_bytes());
+                message[8..16].copy_from_slice(&pending.ready_ms.to_le_bytes());
+                message[16..18].copy_from_slice(&(width as u16).to_le_bytes());
+                message[18..20].copy_from_slice(&(height as u16).to_le_bytes());
+                message[20..24].copy_from_slice(&pending.vi_no.to_le_bytes());
+                if !send_media(Message::Binary(message.into())) {
+                    STATS.dropped.fetch_add(1, Relaxed);
+                }
+            }
+        });
+        tx
+    })
+}
+
+/// Before the RDP closes: the readback thread done with every frame it holds.
+pub fn wait_for_frames() {
+    while FRAMES_IN_FLIGHT.load(Acquire) > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 

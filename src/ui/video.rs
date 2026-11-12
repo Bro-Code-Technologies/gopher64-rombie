@@ -193,6 +193,7 @@ fn fps_counter(ui: &mut ui::Ui) {
 }
 
 pub fn close(ui: &ui::Ui) {
+    crate::rombie::wait_for_frames();
     unsafe {
         rdp_close();
         sdl3_sys::video::SDL_DestroyWindow(ui.video.window);
@@ -207,16 +208,34 @@ pub fn render_frame() {
     unsafe { rdp_render_frame() }
 }
 
-/// Rombie's engine mode: reads the frame back as RGBA into `out`, after its first `header` bytes.
-pub fn read_frame(out: &mut Vec<u8>, header: usize) -> Option<(u32, u32)> {
-    let frame = unsafe { rdp_read_frame() };
-    if frame.pixels.is_null() {
+/// Rombie's engine mode: a frame being read back, started where the game runs (interface.cpp says why in two halves).
+pub struct Frame {
+    handle: usize,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub fn start_frame() -> Option<Frame> {
+    let frame = unsafe { rdp_start_frame() };
+    if frame.frame.is_null() {
         return None;
     }
-    let len = frame.width as usize * frame.height as usize * 4;
-    out.resize(header + len, 0);
-    out[header..].copy_from_slice(unsafe { std::slice::from_raw_parts(frame.pixels, len) });
-    Some((frame.width, frame.height))
+    Some(Frame {
+        handle: frame.frame as usize,
+        width: frame.width,
+        height: frame.height,
+    })
+}
+
+/// On any thread: waits for the GPU and reads the frame as RGBA into `out`, after its first `header` bytes.
+pub fn finish_frame(frame: Frame, out: &mut Vec<u8>, header: usize) {
+    out.resize(header + frame.width as usize * frame.height as usize * 4, 0);
+    unsafe {
+        rdp_finish_frame(
+            frame.handle as *mut std::ffi::c_void,
+            out[header..].as_mut_ptr(),
+        )
+    }
 }
 
 pub fn state_size() -> usize {

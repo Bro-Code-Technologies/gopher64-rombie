@@ -142,7 +142,11 @@ pub fn update_screen(device: &mut device::Device) {
     }
 
     if !netplay::in_rollback(device.netplay.as_ref()) {
+        let started = std::time::Instant::now();
         ui::video::update_screen();
+        if crate::rombie::active() {
+            crate::rombie::add_frame_context_time(started);
+        }
         ui::speed_log("f", (device.vi.frame_time * 1e9) as u64);
         device.speed_limiter.frame_counter += 1;
         let _ = device.ui.video.vis_tx.as_ref().unwrap().send(true);

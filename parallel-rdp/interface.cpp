@@ -141,7 +141,6 @@ static std::queue<JoystickEvent> joystick_events;
 // Granite picks the discrete GPU (GRANITE_VULKAN_DEVICE_INDEX picks another).
 static Vulkan::ContextHandle headless_context;
 static Vulkan::DeviceHandle headless_device;
-static std::vector<RDP::RGBA> headless_frame;
 
 static Vulkan::Device &get_device() {
   return headless_device ? *headless_device : wsi->get_device();
@@ -167,6 +166,17 @@ static bool init_headless() {
   headless_device->set_context(*headless_context);
   // Granite names the GPU it picked only in debug builds, and on a two-GPU PC its "Found" lines list both.
   LOGI("Using Vulkan GPU: %s\n", headless_device->get_gpu_properties().deviceName);
+  // parallel-rdp's subgroup tile binning drew differently on an Intel UHD Graphics 630: its RDRAM differed from the
+  // other PCs' from a lockstep replay's first frame, and without subgroups it matched them. The renderer reads this as
+  // the processor is made; one set by hand still wins.
+  if (headless_device->get_gpu_properties().vendorID == VENDOR_ID_INTEL &&
+      !getenv("PARALLEL_RDP_SUBGROUP")) {
+#ifdef _WIN32
+    _putenv_s("PARALLEL_RDP_SUBGROUP", "0");
+#else
+    setenv("PARALLEL_RDP_SUBGROUP", "0", 0);
+#endif
+  }
   return true;
 }
 
@@ -594,7 +604,6 @@ void rdp_close() {
   }
 
   if (headless_device || headless_context) {
-    headless_frame = {};
     headless_device.reset();
     headless_context.reset();
     return;
@@ -808,14 +817,29 @@ void rdp_render_frame() {
   render_frame(device);
 }
 
-RDP_FRAME rdp_read_frame() {
-  unsigned width = 0, height = 0;
-  processor->scanout_sync(headless_frame, width, height, scanout_options());
-  return RDP_FRAME{
-      headless_frame.empty()
-          ? nullptr
-          : reinterpret_cast<const uint8_t *>(headless_frame.data()),
-      width, height};
+// A frame read back in two halves, as scanout_sync's are: the start records the scanout and its copy where the game
+// runs, and the finish waits for the GPU on the thread that sends the frame, so the game goes on meanwhile. Waiting at
+// every VI cost a GTX 1060 laptop a sixth of each second. Granite's fence waits, maps and frees are thread-safe.
+RDP_FRAME rdp_start_frame() {
+  auto *scanout = new RDP::VIScanoutBuffer;
+  processor->scanout_async_buffer(*scanout, scanout_options());
+  if (!scanout->width || !scanout->height) {
+    delete scanout;
+    return RDP_FRAME{nullptr, 0, 0};
+  }
+  return RDP_FRAME{scanout, scanout->width, scanout->height};
+}
+
+void rdp_finish_frame(void *frame, uint8_t *rgba) {
+  auto *scanout = static_cast<RDP::VIScanoutBuffer *>(frame);
+  scanout->fence->wait();
+  memcpy(rgba,
+         headless_device->map_host_buffer(*scanout->buffer,
+                                          Vulkan::MEMORY_ACCESS_READ_BIT),
+         size_t(scanout->width) * scanout->height * sizeof(uint32_t));
+  headless_device->unmap_host_buffer(*scanout->buffer,
+                                     Vulkan::MEMORY_ACCESS_READ_BIT);
+  delete scanout;
 }
 
 void rdp_update_screen() {
