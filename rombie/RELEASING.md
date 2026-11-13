@@ -78,7 +78,7 @@ one.
      PowerShell only shows its output when it is piped, as here.
    - Run the exe once. It says it is set up. This also re-registers the `rombie-n64://` link to this folder, so a
      tester who had an older engine installed must do it once, or the browser keeps starting the old one.
-   - Play an N64 game from Rombie's dev server (`http://localhost:5173`). The browser's prompts ("Open Rombie N64
+   - Play an N64 game from Rombie's dev server (`http://localhost:10020`). The browser's prompts ("Open Rombie N64
      Engine?", tick Always allow, and access to other apps and services) should appear the first time.
 7. **Tag the release commit and push the tag:**
    ```powershell

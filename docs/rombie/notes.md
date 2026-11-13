@@ -135,8 +135,9 @@ like Phase 2's speed test.
   Running the exe again from a new folder points it there. Browsers show the exe's version resource name, "Rombie N64
   Engine" (`build.rs`, the engine build only), in their prompt.
 - **Who may connect.** The engine listens on 127.0.0.1:47654 only, with `SO_EXCLUSIVEADDRUSE`. A page must come from
-  `https://rombie.app`, `https://staged.rombie.app` or the dev server (`http://localhost:5173`,
-  `http://127.0.0.1:5173`), or from `--origin` in development; anything else, or no `Origin`, gets a 403. It must
+  `https://rombie.app`, `https://staged.rombie.app` or Rombie's local port block, any port from 10020 to 10029 on
+  `http://localhost` or `http://127.0.0.1`, which covers the dev server and the preview (after 2026.0.0; 2026.0.0 and
+  earlier admit only port 5173), or from `--origin` in development; anything else, or no `Origin`, gets a 403. It must
   present the current key. One page at a time. Refusals a page should understand complete the handshake and close at
   once with a code: 4001 the key isn't this engine's, 4002 another page is playing, 4003 the game is stopping.
 - **Started on demand.** Rombie opens `rombie-n64://start?key=<random key>`, and Windows runs the engine with

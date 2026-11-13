@@ -74,12 +74,13 @@ pub const VERSION: &str = env!("ROMBIE_N64_ENGINE_VERSION");
 const PROTOCOL: u32 = 1;
 const ENGINE_PORT: u16 = 47654;
 const LINK_SCHEME: &str = "rombie-n64";
-const ALLOWED_ORIGINS: [&str; 4] = [
-    "https://rombie.app",
-    "https://staged.rombie.app",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-];
+/// The only pages that may drive the engine: Rombie in production, its staging site, and Rombie's local servers below.
+const ALLOWED_ORIGINS: [&str; 2] = ["https://rombie.app", "https://staged.rombie.app"];
+/// Rombie's local port block (brotocol's web-apps profile): its dev server, its preview and the rest of the block, on
+/// either local host name.
+const DEV_BLOCK_HOSTS: [&str; 2] = ["http://localhost:", "http://127.0.0.1:"];
+const DEV_BLOCK_FIRST_PORT: u16 = 10020;
+const DEV_BLOCK_LAST_PORT: u16 = 10029;
 /// How long a link-started engine waits for its page, and how long a running game outlives its page so a reload can
 /// come back to it.
 const STARTUP_WAIT_S: f64 = 60.0;
@@ -475,6 +476,17 @@ pub fn main() -> Option<i32> {
     Some(run(mode, port))
 }
 
+/// Exactly a block host and five digits within the block, with nothing after them.
+fn dev_block_origin(origin: &str) -> bool {
+    DEV_BLOCK_HOSTS.iter().any(|host| {
+        origin
+            .strip_prefix(host)
+            .filter(|port| port.len() == 5 && port.bytes().all(|c| c.is_ascii_digit()))
+            .and_then(|port| port.parse::<u16>().ok())
+            .is_some_and(|port| (DEV_BLOCK_FIRST_PORT..=DEV_BLOCK_LAST_PORT).contains(&port))
+    })
+}
+
 fn valid_key(key: &str) -> bool {
     (16..=128).contains(&key.len())
         && key
@@ -748,6 +760,7 @@ fn decide(request: &Request) -> Decision {
         return Decision::Status(204);
     }
     let allowed = ALLOWED_ORIGINS.contains(&request.origin.as_str())
+        || dev_block_origin(&request.origin)
         || engine.dev_origin.as_deref() == Some(request.origin.as_str());
     if !request.upgrade || request.ws_key.is_empty() || !allowed {
         eprintln!("rombie: refused origin '{}'", request.origin);
