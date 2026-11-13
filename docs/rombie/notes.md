@@ -136,9 +136,9 @@ like Phase 2's speed test.
   Engine" (`build.rs`, the engine build only), in their prompt.
 - **Who may connect.** The engine listens on 127.0.0.1:47654 only, with `SO_EXCLUSIVEADDRUSE`. A page must come from
   `https://rombie.app`, `https://staged.rombie.app` or Rombie's local port block, any port from 10020 to 10029 on
-  `http://localhost` or `http://127.0.0.1`, which covers the dev server and the preview (after 2026.0.0; 2026.0.0 and
-  earlier admit only port 5173), or from `--origin` in development; anything else, or no `Origin`, gets a 403. It must
-  present the current key. One page at a time. Refusals a page should understand complete the handshake and close at
+  `http://localhost` or `http://127.0.0.1`, which covers the dev server and the preview (from 2026.0.0, the first
+  release; development builds before `3c4a292` admit only port 5173), or from `--origin` in development; anything else,
+  or no `Origin`, gets a 403. It must present the current key. One page at a time. Refusals a page should understand complete the handshake and close at
   once with a code: 4001 the key isn't this engine's, 4002 another page is playing, 4003 the game is stopping.
 - **Started on demand.** Rombie opens `rombie-n64://start?key=<random key>`, and Windows runs the engine with
   `--link <url>`. If an engine already holds the port, the new one hands it the key (`GET /handoff` with an
