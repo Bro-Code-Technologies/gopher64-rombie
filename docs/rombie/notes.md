@@ -36,6 +36,7 @@ README's notice at the top points here. Each change is in its own section below.
 | 2026-11-11 | the commit after `a301767` | The log names the GPU in use (Phase 6) |
 | 2026-11-11 | the commit after `38ab61f` | The full-sync wait, the speed limiter's sleep and the hashing timed in the stats, and RDRAM dumps for the lockstep checks (Phase 6) |
 | 2026-11-11 | the commit after `7c2d8b3` | Frames read back on their own thread while the game runs on, the frame context's wait in the stats, and no subgroups on Intel GPUs (Phase 6) |
+| 2026-11-12 | `3c4a292` | Pages from Rombie's local port block, any port from 10020 to 10029, admitted in place of port 5173 (brocodetech's BRAIN-15) |
 
 ## Building (Windows)
 
@@ -138,8 +139,9 @@ like Phase 2's speed test.
   `https://rombie.app`, `https://staged.rombie.app` or Rombie's local port block, any port from 10020 to 10029 on
   `http://localhost` or `http://127.0.0.1`, which covers the dev server and the preview (from 2026.0.0, the first
   release; development builds before `3c4a292` admit only port 5173), or from `--origin` in development; anything else,
-  or no `Origin`, gets a 403. It must present the current key. One page at a time. Refusals a page should understand complete the handshake and close at
-  once with a code: 4001 the key isn't this engine's, 4002 another page is playing, 4003 the game is stopping.
+  or no `Origin`, gets a 403. It must present the current key. One page at a time. Refusals a page should understand
+  complete the handshake and close at once with a code: 4001 the key isn't this engine's, 4002 another page is playing,
+  4003 the game is stopping.
 - **Started on demand.** Rombie opens `rombie-n64://start?key=<random key>`, and Windows runs the engine with
   `--link <url>`. If an engine already holds the port, the new one hands it the key (`GET /handoff` with an
   `X-Rombie-Handoff` header, which a web page can't send without a CORS preflight the engine never answers) and exits.

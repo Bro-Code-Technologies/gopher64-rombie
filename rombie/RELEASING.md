@@ -50,9 +50,14 @@ one.
    can't replace it. Check Task Manager.
 4. **Build** the engine build, as the notes' "Building (Windows)" says, in its environment:
    ```powershell
+   cargo clean -p gopher64 --release --target=x86_64-pc-windows-msvc
    cargo build --release --no-default-features --target=x86_64-pc-windows-msvc
    .\target\x86_64-pc-windows-msvc\release\gopher64.exe --version | Out-String   # must print the new version
    ```
+   The `cargo clean -p gopher64` makes `build.rs` run again. It reruns only when the paths it lists change, not
+   `src/` or the commit, so without it the exe keeps the `git describe` of whichever build last ran it, and its hello
+   (`gopher64=v1.1.42-<n>-g<commit>`) names an older commit than the one you tag. It cleans only gopher64 itself, so
+   the build takes about a minute.
 5. **Package** (from the fork's root, in the same environment, since it runs `cargo tree`, `cargo metadata` and
    `cargo vendor`):
    ```powershell
